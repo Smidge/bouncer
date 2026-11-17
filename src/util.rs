@@ -249,6 +249,12 @@ pub fn trusted_owner(uid: u32) -> bool {
 /// Checks a file holding key material: a regular file owned by us (or root), mode exactly
 /// 0600 or 0400.
 pub fn check_secret_file(meta: &fs::Metadata, path: &Path) -> Result<()> {
+    check_secret_mode(meta, path, false)
+}
+
+/// As `check_secret_file`; `systemd_credential` also accepts 0440, which systemd uses for
+/// files in its private, per-service `$CREDENTIALS_DIRECTORY` mount.
+pub fn check_secret_mode(meta: &fs::Metadata, path: &Path, systemd_credential: bool) -> Result<()> {
     let mode = meta.mode() & 0o7777;
     if !meta.file_type().is_file() {
         return Err(err!("{} is not a regular file", path.display()));
@@ -261,7 +267,7 @@ pub fn check_secret_file(meta: &fs::Metadata, path: &Path) -> Result<()> {
             geteuid()
         ));
     }
-    if mode != 0o600 && mode != 0o400 {
+    if mode != 0o600 && mode != 0o400 && !(systemd_credential && mode == 0o440) {
         return Err(err!(
             "{} has mode {mode:04o}; it must be 0600 or 0400 (run: chmod 600 {})",
             path.display(),
@@ -306,10 +312,19 @@ pub fn open_nofollow(path: &Path) -> io::Result<File> {
 
 /// Reads a small key or credential file after checking owner and mode on the open fd.
 pub fn read_secret_file(path: &Path, max: u64) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    read_secret(path, max, false)
+}
+
+/// `read_secret_file` for a file in systemd's `$CREDENTIALS_DIRECTORY` (see `check_secret_mode`).
+pub fn read_credential_file(path: &Path, max: u64) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    read_secret(path, max, true)
+}
+
+fn read_secret(path: &Path, max: u64, credential: bool) -> Result<zeroize::Zeroizing<Vec<u8>>> {
     use std::io::Read;
     let f = ctx(open_nofollow(path), "cannot open", path)?;
     let meta = ctx(f.metadata(), "cannot stat", path)?;
-    check_secret_file(&meta, path)?;
+    check_secret_mode(&meta, path, credential)?;
     let mut buf = zeroize::Zeroizing::new(Vec::with_capacity(128));
     ctx(f.take(max + 1).read_to_end(&mut buf), "cannot read", path)?;
     if buf.len() as u64 > max {
@@ -659,6 +674,11 @@ mod tests {
         fs::write(&p, "x").unwrap();
         fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read_secret_file(&p, 100).is_err());
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o440)).unwrap();
+        assert!(read_secret_file(&p, 100).is_err());
+        assert_eq!(&**read_credential_file(&p, 100).unwrap(), b"x");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(read_credential_file(&p, 100).is_err());
         fs::set_permissions(&p, fs::Permissions::from_mode(0o400)).unwrap();
         assert_eq!(&**read_secret_file(&p, 100).unwrap(), b"x");
         std::os::unix::fs::symlink(&p, d.join("l")).unwrap();

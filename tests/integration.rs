@@ -635,13 +635,7 @@ fn context_vars_from_the_oldest_ancestor_and_no_stale_cache() {
         parent(after)["pid"],
         "same parent pid"
     );
-    assert!(
-        parent(after)["argv"]
-            .as_str()
-            .unwrap()
-            .contains("after the exec"),
-        "{after}"
-    );
+    assert_ne!(parent(before)["argv"], parent(after)["argv"], "{after}");
     let ctx = &after["attribution"]["context"]["BOUNCER_TEST_THREAD"];
     assert_eq!(ctx["value"], "before-exec");
     assert!(

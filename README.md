@@ -222,7 +222,7 @@ bouncer creates directories with mode 0700 and files with mode 0600. It checks p
 
 - The vault and log directories must be owned by the daemon's uid, must not be symlinks, and must have no group or other access. The socket directory must not be writable by group or others.
 - The vault, the audit log and the lock file must be regular files owned by the daemon's uid with no group or other access.
-- The key file and credential files must be regular files, owned by the daemon's uid or root, with mode exactly 0600 or 0400. Symlinks are refused.
+- The key file and credential files must be regular files, owned by the daemon's uid or root, with mode exactly 0600 or 0400. Files that systemd provides in `$CREDENTIALS_DIRECTORY` may also be 0440, the mode systemd uses inside its private per-service credentials mount. Symlinks are refused.
 - An existing socket path is only removed if it is a socket owned by the daemon's uid that nobody is listening on.
 
 Files are written atomically: a temp file with a random name, created with `O_CREAT|O_EXCL|O_NOFOLLOW` at its final mode inside the verified directory, then fsync, rename, and fsync of the directory.

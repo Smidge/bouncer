@@ -103,7 +103,7 @@ fn check_secret(r: &mut Report, what: &str, s: &SecretRef) {
                 r.note(format!("{what} {}: cannot inspect (permission denied)", p.display()))
             }
             Err(e) => r.bad(format!("{what} {}: {e}", p.display())),
-            Ok(m) => match util::check_secret_file(&m, &p) {
+            Ok(m) => match util::check_secret_mode(&m, &p, matches!(s, SecretRef::Credential(_))) {
                 Ok(()) => r.ok(format!("{what} {} (mode {:04o})", p.display(), m.mode() & 0o7777)),
                 Err(e) => r.bad(format!("{what}: {e}")),
             },

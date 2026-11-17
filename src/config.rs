@@ -74,7 +74,10 @@ impl SecretRef {
 
     fn read(&self) -> Result<zeroize::Zeroizing<String>> {
         let path = self.path()?;
-        let bytes = util::read_secret_file(&path, 64 * 1024)?;
+        let bytes = match self {
+            SecretRef::File(_) => util::read_secret_file(&path, 64 * 1024)?,
+            SecretRef::Credential(_) => util::read_credential_file(&path, 64 * 1024)?,
+        };
         let s = std::str::from_utf8(&bytes)
             .map_err(|_| err!("{} is not UTF-8 text", path.display()))?;
         let s = zeroize::Zeroizing::new(s.trim().to_string());

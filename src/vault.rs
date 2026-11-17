@@ -206,7 +206,10 @@ pub fn load_key(src: &KeySource) -> Result<Key> {
         }
         KeySource::Credential(name) => {
             let p = crate::config::SecretRef::Credential(name.clone()).path()?;
-            parse_key(&util::read_secret_file(&p, 4096)?, &p.display().to_string())
+            parse_key(
+                &util::read_credential_file(&p, 4096)?,
+                &p.display().to_string(),
+            )
         }
         KeySource::Command(argv) => {
             let out = std::process::Command::new(&argv[0])
