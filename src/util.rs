@@ -245,9 +245,25 @@ pub fn split_path(path: &Path) -> Result<(PathBuf, &OsStr)> {
     Ok((parent, name))
 }
 
-/// Who may own a file bouncer reads its key or credentials from.
+/// The uid the daemon drops to in dedicated-user mode, while it still runs as root to read
+/// credentials (`u32::MAX`: none).
+static SERVICE_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Dedicated-user mode: while still root, also trust files owned by the user the daemon is
+/// about to become (so the same files work before and after the privilege drop).
+pub fn set_service_uid(uid: u32) {
+    SERVICE_UID.store(uid, std::sync::atomic::Ordering::Release);
+}
+
+/// Who may own a file bouncer reads its key or credentials from: the daemon's uid, root, and
+/// while starting as root in dedicated-user mode, the service user.
 pub fn trusted_owner(uid: u32) -> bool {
-    uid == geteuid() || uid == 0
+    trusted_owner_for(uid, geteuid())
+}
+
+fn trusted_owner_for(uid: u32, euid: u32) -> bool {
+    let service = SERVICE_UID.load(std::sync::atomic::Ordering::Acquire);
+    uid == euid || uid == 0 || (euid == 0 && service != u32::MAX && uid == service)
 }
 
 /// Checks a file holding key material: a regular file owned by us (or root), mode exactly
@@ -259,16 +275,38 @@ pub fn check_secret_file(meta: &fs::Metadata, path: &Path) -> Result<()> {
 /// As `check_secret_file`; `systemd_credential` also accepts 0440, which systemd uses for
 /// files in its private, per-service `$CREDENTIALS_DIRECTORY` mount.
 pub fn check_secret_mode(meta: &fs::Metadata, path: &Path, systemd_credential: bool) -> Result<()> {
-    let mode = meta.mode() & 0o7777;
-    if !meta.file_type().is_file() {
+    check_secret_meta(
+        meta.file_type().is_file(),
+        meta.uid(),
+        meta.mode(),
+        path,
+        systemd_credential,
+        geteuid(),
+    )
+}
+
+fn check_secret_meta(
+    regular: bool,
+    owner: u32,
+    mode: u32,
+    path: &Path,
+    systemd_credential: bool,
+    euid: u32,
+) -> Result<()> {
+    let mode = mode & 0o7777;
+    if !regular {
         return Err(err!("{} is not a regular file", path.display()));
     }
-    if !trusted_owner(meta.uid()) {
+    if !trusted_owner_for(owner, euid) {
+        let service = SERVICE_UID.load(std::sync::atomic::Ordering::Acquire);
+        let also = if euid == 0 && service != u32::MAX {
+            format!(", uid {service} or root")
+        } else {
+            " (or root)".to_string()
+        };
         return Err(err!(
-            "{} is owned by uid {}; it must be owned by uid {} (or root)",
+            "{} is owned by uid {owner}; it must be owned by uid {euid}{also}",
             path.display(),
-            meta.uid(),
-            geteuid()
         ));
     }
     if mode != 0o600 && mode != 0o400 && !(systemd_credential && mode == 0o440) {
@@ -728,6 +766,32 @@ mod tests {
         let e = Dir::open(&d.join("a/s"), false).err().unwrap().to_string();
         assert!(e.contains("symlink"), "{e}");
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn service_user_files_are_trusted_while_root() {
+        let p = Path::new("/etc/bouncer/token");
+        let check = |owner, mode, euid| check_secret_meta(true, owner, mode, p, false, euid);
+        // Before a service uid is known, root trusts only root.
+        assert!(check(0, 0o600, 0).is_ok());
+        assert!(check(999, 0o600, 0).is_err());
+        set_service_uid(999);
+        // Starting as root in dedicated-user mode: the service user's files are fine...
+        assert!(check(999, 0o600, 0).is_ok());
+        assert!(check(999, 0o400, 0).is_ok());
+        // ...with the same mode rules...
+        assert!(check(999, 0o640, 0).is_err());
+        assert!(check(999, 0o644, 0).is_err());
+        assert!(check_secret_meta(false, 999, 0o600, p, false, 0).is_err());
+        // ...and nobody else's.
+        let e = check(1000, 0o600, 0).unwrap_err().to_string();
+        assert!(e.contains("uid 999 or root"), "{e}");
+        // After the drop (euid 999) the rule is the usual one.
+        assert!(check(999, 0o600, 999).is_ok());
+        assert!(check(0, 0o600, 999).is_ok());
+        assert!(check(1000, 0o600, 999).is_err());
+        // An ordinary user never trusts the service uid.
+        assert!(check(999, 0o600, 1000).is_err());
     }
 
     #[test]

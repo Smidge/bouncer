@@ -266,6 +266,7 @@ pub fn serve(mut cfg: Config, opts: Options) -> Result<()> {
                 Attributor::new(cfg.context_vars.clone(), cfg.max_chain_depth),
             )?;
             attr = AttrSource::Inspector(inspector);
+            util::set_service_uid(uid);
             if cfg.mlock {
                 crate::harden::raise_memlock();
             }
