@@ -1,0 +1,20 @@
+# bouncer as a per-user service (Linux), running as your own user.
+#
+# Simple, but any process running as you can also read the vault and key files.
+# See "Threat model" in the README.
+#
+#   bouncer init
+#   install -D -m 0644 contrib/bouncer-user.service ~/.config/systemd/user/bouncer.service
+#   systemctl --user daemon-reload && systemctl --user enable --now bouncer
+
+[Unit]
+Description=bouncer secret store for agents (per-user)
+Documentation=https://github.com/Smidge/bouncer
+
+[Service]
+ExecStart=%h/.cargo/bin/bouncer serve
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

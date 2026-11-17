@@ -1,0 +1,32 @@
+[package]
+name = "bouncer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A tiny local secret store for LLM agents: every fetch needs a reason and is written to a hash-chained audit log."
+license = "MIT"
+repository = "https://github.com/Smidge/bouncer"
+readme = "README.md"
+keywords = ["secrets", "audit", "llm", "agents", "vault"]
+categories = ["command-line-utilities", "cryptography"]
+
+[features]
+default = ["s3"]
+# Ship audit entries to an S3-compatible bucket (AWS, Cloudflare R2, iDrive E2, MinIO...).
+s3 = ["dep:ureq", "dep:md-5", "dep:hmac"]
+
+[dependencies]
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
+getrandom = "0.4.3"
+hmac = { version = "0.13.0", optional = true }
+libc = "0.2.191"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+md-5 = { version = "0.11.0", optional = true }
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"], optional = true }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
