@@ -204,9 +204,12 @@ pub fn read_frame(
         if left.is_zero() {
             return Err(FrameError::Timeout);
         }
-        stream
-            .set_read_timeout(Some(left))
-            .map_err(FrameError::Io)?;
+        // macOS refuses to set a timeout (EINVAL) once the peer has shut the connection
+        // down; a read then cannot block, and still returns what the peer sent first.
+        match stream.set_read_timeout(Some(left)) {
+            Err(e) if e.raw_os_error() != Some(libc::EINVAL) => return Err(FrameError::Io(e)),
+            _ => {}
+        }
         match (&*stream).read(&mut chunk[..]) {
             Ok(0) => return Err(FrameError::Unterminated),
             Ok(n) => {
@@ -287,7 +290,9 @@ pub fn call(
             .map_err(|_| CallError::Unreachable("cannot encode request".into()))?,
     );
     line.push(b'\n');
-    (&stream).write_all(&line).map_err(io)?;
+    // The daemon may answer and close before reading anything (a uid it does not accept,
+    // "busy"); that answer is still readable after our write fails.
+    let sent = (&stream).write_all(&line);
     let resp = match read_frame(
         &stream,
         Instant::now() + timeout,
@@ -295,6 +300,7 @@ pub fn call(
         MAX_RESPONSE,
     ) {
         Ok(r) => r,
+        Err(_) if sent.is_err() => return Err(io(sent.unwrap_err())),
         Err(FrameError::Unterminated) => {
             return Err(CallError::Unreachable(
                 "daemon closed the connection without answering".into(),

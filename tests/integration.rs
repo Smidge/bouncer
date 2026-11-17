@@ -755,7 +755,7 @@ fn other_uids_are_closed_before_reading_and_aggregated() {
         assert!(t.elapsed() < Duration::from_secs(1));
     }
     let out = env.get("A");
-    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
     std::thread::sleep(Duration::from_millis(100));
     let rejects: Vec<_> = env
         .log_entries()
