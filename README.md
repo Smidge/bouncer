@@ -4,8 +4,8 @@ A small local secret store for LLM agents. An agent asks for a secret by name an
 
 By default bouncer does not judge the reason: any caller with a long enough reason gets the secret, and the point is accountability. When an agent uses a token, you can see which session asked for it and what it said it was doing. An optional admission check asks an LLM whether the reason justifies the request before anything is released (see [Admission check](#admission-check)).
 
-- One binary, about 2.5 MB with the network features and 1.0 MB without (release build, stripped, macOS arm64). No async runtime.
-- Secrets stay decrypted in the daemon's memory. A `get` over the socket takes about 75 µs at p50 and 160 µs at p99, including attribution and the audit write (see [Performance](#performance)).
+- One binary, about 2.6 MB with the network features and 1.1 MB without (release build, stripped, macOS arm64). No async runtime.
+- Secrets stay decrypted in the daemon's memory. A `get` over the socket takes about 85 µs at p50 and 170 µs at p99, including attribution and the audit write (see [Performance](#performance)).
 - The vault is one XChaCha20-Poly1305 encrypted file with a generation counter, so a rolled-back vault is detected.
 - Audit entries can also go to S3-compatible buckets, InfluxDB, a webhook, a mirror file or syslog.
 
@@ -142,7 +142,7 @@ bouncer keygen | xargs -I{} security add-generic-password -a "$USER" -s bouncer-
 key_command = ["security", "find-generic-password", "-a", "me", "-s", "bouncer-key", "-w"]
 ```
 
-Any process running as you can usually run the same command, so this protects the key from being copied off disk by file-level tools and backups, not from your own user.
+The command runs without a shell in its own process group. It must exit successfully within 10 seconds and print at most 4 KiB; otherwise the whole group is killed. Any process running as you can usually run the same command, so this protects the key from being copied off disk by file-level tools and backups, not from your own user.
 
 ### Dedicated-user mode (Linux)
 
@@ -150,7 +150,7 @@ The daemon runs as a `bouncer` system user. Agents running as your login user ca
 
 When `bouncer serve` starts as root with `user = "bouncer"` in the config, it separates privileges the way OpenSSH does:
 
-1. Before any thread or secret exists, it forks an attribution helper. The helper drops every capability except `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH` (needed to read another user's `/proc/<pid>/environ`, which is mode 0400), switches to the `bouncer` uid, sets `no_new_privs`, and only answers "attribute pid X" over a socketpair. It never sees the key, the vault or a client.
+1. Before any thread or secret exists, it forks an attribution helper. The helper drops every capability except `CAP_SYS_PTRACE` and `CAP_DAC_READ_SEARCH` (needed to read another user's `/proc/<pid>/environ`, which is mode 0400), switches to the `bouncer` uid, sets `no_new_privs`, and only answers "attribute pid X". It never sees the key, the vault or a client. The daemon keeps up to 8 channels to it (socketpairs the helper creates and passes back), so several connections are attributed at once. Each request carries an id the reply must echo, and a channel that times out or answers out of turn is closed, never reused.
 2. The main process reads root-only credentials (systemd `$CREDENTIALS_DIRECTORY`), hands `/run/bouncer` to the `bouncer` user, then drops to `bouncer` with no capabilities and only the socket group as a supplementary group, and checks it cannot regain root.
 
 The key is best supplied as an encrypted systemd credential, so it never sits on disk in a readable form. systemd encrypts it with the host key and, when the machine has a TPM, seals it to the TPM.
@@ -204,6 +204,10 @@ sudo -u bouncer env BOUNCER_CONFIG=/etc/bouncer/config.toml bouncer verify-log -
 
 Without systemd, `sudo bouncer serve` with the same config does the same privilege drop; use `key = "/var/lib/bouncer/key"` (a 0600 file owned by `bouncer`) instead of the credential.
 
+If the helper dies, every attribution is `unavailable`, so `get` and `exec` are denied (with `require_attribution = true`), and `bouncer status` and `bouncer doctor` report that the helper is down. The daemon cannot start a new one, because it no longer has the capabilities the helper needs: restart the service (`systemctl restart bouncer`).
+
+`bouncer doctor` judges ownership against the uid the daemon runs as. Run as the `bouncer` user (or root) it checks the key, vault and log itself; run as another user it shows the same checks as made by the daemon (`status` carries them), or says it could not make them.
+
 macOS has no equivalent of the helper, so dedicated-user mode is Linux only; `bouncer serve` refuses to run as root on macOS.
 
 ## Paths
@@ -222,7 +226,7 @@ bouncer creates directories with mode 0700 and files with mode 0600. It checks p
 
 - The vault and log directories must be owned by the daemon's uid, must not be symlinks, and must have no group or other access. The socket directory must not be writable by group or others.
 - The vault, the audit log and the lock file must be regular files owned by the daemon's uid with no group or other access.
-- The key file and credential files must be regular files, owned by the daemon's uid or root, with mode exactly 0600 or 0400. Files that systemd provides in `$CREDENTIALS_DIRECTORY` may also be 0440, the mode systemd uses inside its private per-service credentials mount. Symlinks are refused.
+- The key file and credential files must be regular files, owned by the daemon's uid or root, with mode exactly 0600 or 0400. In dedicated-user mode, while `serve` still runs as root to read them, files owned by the service user are accepted too. Files that systemd provides in `$CREDENTIALS_DIRECTORY` may also be 0440, the mode systemd uses inside its private per-service credentials mount. Symlinks are refused.
 - An existing socket path is only removed if it is a socket owned by the daemon's uid that nobody is listening on.
 
 Files are written atomically: a temp file with a random name, created with `O_CREAT|O_EXCL|O_NOFOLLOW` at its final mode inside the verified directory, then fsync, rename, and fsync of the directory.
@@ -231,7 +235,7 @@ The daemon holds an exclusive `flock` on `bouncer.lock` next to the vault for it
 
 ## Configuration
 
-The config file is a strict subset of TOML: top-level keys, `[table]` and `[[array]]` headers, strings, integers, booleans and single-line arrays. A hand-written parser for that subset is about 120 lines and keeps the `toml` crate and its dependencies out of the build. Unknown keys are errors. Every key is optional; the values below are the defaults unless the comment says otherwise.
+The config file is a strict subset of TOML: top-level keys, `[table]` and `[[array]]` headers, strings, integers, booleans and single-line arrays. A hand-written parser for that subset is about 120 lines and keeps the `toml` crate and its dependencies out of the build. Unknown keys are errors in every table, including an `[admission]` table with `enabled = false`, so a typo such as `enabeld = true` is reported rather than leaving the check off. Every key is optional; the values below are the defaults unless the comment says otherwise.
 
 ```toml
 # Socket and access
@@ -309,8 +313,8 @@ api_key_file = "/etc/bouncer/anthropic-key"        # or api_key_credential = "na
 timeout_ms = 8000
 on_error = "deny"                      # or "allow"
 system_prompt_file = "/etc/bouncer/admission-prompt.txt"  # optional; a built-in prompt is used otherwise
-cache_ttl_secs = 0                     # reuse decisions for the same (session, secrets, reason)
-history = 5                            # recent requests from the same session given as context
+cache_ttl_secs = 0                     # reuse a decision for an identical request (see Admission check)
+history = 5                            # recent requests from the same uid and session given as context
 ```
 
 Credential files (`*_file`) must be mode 0600 or 0400 and owned by the daemon's uid or root. `*_credential = "name"` reads `$CREDENTIALS_DIRECTORY/name`, for systemd `LoadCredential=` or `LoadCredentialEncrypted=`. Sink and admission credentials can no longer come from the vault: anything in the vault can be read by clients. An old `[s3]` table with `access_key_id_secret` is rejected with a message explaining the change; an `[s3]` table with `*_file` keys still works as one S3 sink.
@@ -323,9 +327,9 @@ For every connection the daemon:
 
 1. Gets the peer pid, uid and gid from the kernel (`SO_PEERCRED` on Linux, `getpeereid` and `LOCAL_PEERPID` on macOS) right after `accept`. Connections from uids that are not in `allowed_uids` or `admin_uids` are answered with "denied" and closed before anything is read. They are counted, and at most one `reject` entry per minute summarises them.
 2. On Linux 6.5 and later it also takes a pidfd for the peer (`SO_PEERPIDFD`), and on both systems it records the peer's start time.
-3. Attributes the caller before reading the request, so the caller cannot exit or exec away first. It walks the process tree from the caller to pid 1 (`/proc/<pid>/stat`, `cmdline`, `exe`, `environ` on Linux; `proc_pidinfo`, `proc_pidpath` and `sysctl(KERN_PROCARGS2)` on macOS). It records pid, uid, executable and a shortened argv for the first `max_chain_depth` processes, and the number of ancestors walked. The walk stops at 512 processes and sets `chain_truncated`.
+3. Attributes the caller on a worker thread, before reading the request. It walks the process tree from the caller to pid 1 (`/proc/<pid>/stat`, `cmdline`, `exe`, `environ` on Linux; `proc_pidinfo`, `proc_pidpath` and `sysctl(KERN_PROCARGS2)` on macOS). It records pid, uid, executable and a shortened argv for the first `max_chain_depth` processes, and the number of ancestors walked. The walk stops at 512 processes and sets `chain_truncated`.
 4. Reads the configured context variables from every process's initial environment. Agent harnesses such as T3 Code, Claude Code and Codex set session variables like `T3CODE_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`. The value from the oldest ancestor that has the variable is the primary value, recorded with its pid. Every other distinct value seen below it is recorded too, with its pid (up to 8 per variable, each cut to 256 characters).
-5. Checks that the peer is still the same process (its pidfd is alive and its start time is unchanged). Otherwise the attribution is marked `unavailable`.
+5. Checks that the peer is still the same process (its pidfd is alive and its start time is unchanged). Otherwise the attribution is marked `unavailable`. This catches a caller that exits and is replaced by another process with its pid. It does not catch `exec`, which keeps the pid and the start time: a caller can connect, then exec into another program before or while it is attributed, and the chain then shows the program it became.
 6. Records the caller's working directory and the host name.
 
 Nothing is cached between requests, because a process can exec into another program with the same pid and start time, or rewrite its environment block.
@@ -340,7 +344,9 @@ In dedicated-user mode the attribution helper (see above) reads other users' pro
 
 ## Admission check
 
-With `[admission] enabled = true`, after the reason check passes, bouncer asks an LLM whether to release the secret. The model gets one JSON object: the operation, each secret's name, description and tags, the reason, the caller's uid, session ID, working directory, context values and process chain, and the last `history` requests from the same session with their decisions. It must answer with exactly `{"decision": "allow" | "deny", "reasoning": "..."}`. The decision and reasoning go into the audit entry (`admission`), and the reasoning is shown to the requester on stderr (and in the JSON response).
+With `[admission] enabled = true`, after the reason check passes, bouncer asks an LLM whether to release the secret. The model gets one JSON object: the operation, each secret's name, description and tags, the reason, the caller's uid, session ID, working directory, context values and process chain, and the last `history` requests from the same uid and session with their decisions. It must answer with exactly `{"decision": "allow" | "deny", "reasoning": "..."}`: a repeated key, any other key, or any other decision value is an error. The decision and reasoning go into the audit entry (`admission`), and the reasoning is shown to the requester on stderr (and in the JSON response).
+
+The decision is bound to the versions of the secrets it was made on (each secret records the vault generation that last wrote it). If a secret changes while the model decides, the request is decided again on the new version; if it changes again, the request is denied. With `cache_ttl_secs` above 0, a decision is reused only for the same uid, session, operation, reason, process chain (programs and argv, not pids) and the same versions, descriptions and tags of the same secrets, and any change to the vault clears the cache.
 
 Everything the caller supplies is treated as untrusted data. It is sent only inside a JSON block between `<request_json>` tags, with `<` and `>` escaped so text in a reason cannot close the block, and the system prompt tells the model to ignore instructions in it and to treat such attempts as a reason to deny. Any other reply (extra text, extra keys, a refusal), an HTTP error or a timeout is handled by `on_error`, which defaults to deny.
 
@@ -350,7 +356,7 @@ The model is a filter, not a security boundary. A determined agent can write a c
 
 ## Audit log
 
-The log is JSON Lines, one entry per `get`, `exec`, `set`, `rm` and `ls`, including denials and misses, plus `init`, `start`, `abort`, `reject` and `accept_vault_mismatch` records. Example (wrapped here; it is one line in the file):
+The log is JSON Lines, one entry per `get`, `exec`, `set`, `rm` and `ls`, including denials and misses, plus `init`, `start`, `abort`, `commit_uncertain`, `reconcile`, `reject`, `sink_reject` and `accept_vault_mismatch` records. Example (wrapped here; it is one line in the file):
 
 ```json
 {"ts":"2026-11-17T10:42:07.318Z","seq":42,"log_id":"5b0e...","op":"get","names":["GITHUB_TOKEN"],
@@ -379,9 +385,9 @@ The log is JSON Lines, one entry per `get`, `exec`, `set`, `rm` and `ls`, includ
 | `peer` | uid, gid and pid from the kernel |
 | `attribution` | see [Caller attribution](#caller-attribution) |
 | `prev` | the previous entry's `mac` (64 zeros for the first) |
-| `mac` | HMAC-SHA256 of this line up to `,"mac"`, under a key derived from the vault key |
+| `mac` | HMAC-SHA256, under a key derived from the vault key, of the line without its `mac` member: the bytes up to `,"mac"`, with the closing `}` put back |
 
-Reasons are cut at 1000 characters, descriptions at 500, context values at 256, argv at 8 arguments of 80 characters. An entry is never longer than 64 KiB: if one would be, its chain and context are cut and it gets `"truncated": true`.
+A request with a reason over 1000 characters, a description over 500 or more than 64 names is rejected, not cut. Context values are cut at 256 characters and argv at 8 arguments of 80 characters. An entry is never longer than 64 KiB: if one would be, its process chain and context are shortened, then the chain and working directory dropped, and it gets `"truncated": true`. Names, the reason and the admission record are never cut; a request whose entry would still not fit is refused (the largest valid request fits, and a test checks it).
 
 ### What the log can and cannot show
 
@@ -398,9 +404,9 @@ Removing entries from the end leaves a valid, shorter log. bouncer catches that 
 
 ### When an audit write fails
 
-If writing or fsyncing an entry fails, the daemon truncates the log back to the end of the last complete entry, writes `<audit_log>.failed`, and from then on refuses every `get`, `exec`, `set`, `rm` and `ls` (exit code 7). Restarting does not clear this. Fix the cause (disk full, I/O error), run `bouncer repair` (it cuts any partial entry, verifies the log and removes the marker), then restart the daemon. Background fsync errors in async mode latch the same way. bouncer never rotates the log.
+If writing or fsyncing an entry fails, or the background fsync in async mode fails, the daemon stops releasing anything at once, truncates the log back to the end of the last complete entry, and records the failure in `<audit_log>.state`. That file is created at its full size (4 KiB) when the log is opened, and a failure only overwrites it in place and fsyncs it, so recording a failure needs no new file and no new space on a full disk. The failure is only reported (to the request, in `status`) once it is on disk. From then on every `get`, `exec`, `set`, `rm` and `ls` is refused (exit code 7), and the daemon refuses to start while the state file records a failure (or is damaged). Fix the cause (disk full, I/O error), run `bouncer repair` (it cuts any partial entry, verifies the log and resets the state), then restart the daemon. If even the state file cannot be written, the daemon stays failed in memory and says not to restart it before running `bouncer repair`. bouncer never rotates the log.
 
-Changes are serialised and audited before they take effect: the daemon writes the `set`/`rm` entry with its transaction id first, then saves the vault, then swaps it in memory. If saving fails it writes an `abort` entry for that transaction and the change never becomes visible.
+Changes are serialised and audited before they take effect: the daemon writes the `set`/`rm` entry with its transaction id, the new vault generation and the new file's hash first, then saves the vault, then swaps it in memory. If saving fails before the new file replaces the old one, it writes an `abort` entry for that transaction and the change never becomes visible. If it fails after the rename (the directory fsync), the new vault is on disk but might not survive a crash, so the change is neither committed nor aborted: the daemon writes `commit_uncertain` for the transaction, records the failure in the state file and stops serving. After `bouncer repair` and a restart, the vault file decides: if it has the change, a `reconcile` entry records that it was kept; if it is the version from before, an `abort` entry records that it was lost. Either way no `--accept-vault-mismatch` is needed.
 
 ### Upgrading from version 0.1 logs
 
@@ -408,21 +414,23 @@ Version 0.1 logs used an unkeyed SHA-256 chain. The daemon refuses to start on o
 
 ## Sinks
 
-Each `[[sink]]` gets its own thread, cursor and status. The local log is the spool: a sink reads complete entries past its cursor, but never past what the audit log has fsynced, delivers them, then saves its cursor (`<audit_log>.<name>.cursor`, written atomically and fsynced). The cursor is bound to the log's `log_id`, the destination, and the last delivered entry's seq and MAC. A cursor for another log or destination starts over from the first entry. If the log no longer continues from the cursor (it was rewritten or replaced), the sink stops with an error in `bouncer status` instead of skipping or re-sending. A sink thread that dies is restarted, with backoff from 1 second to 5 minutes; failed deliveries back off the same way. Requests never wait for the network.
+Each `[[sink]]` gets its own thread, cursor and status. The local log is the spool: a sink reads complete entries past its cursor, but never past what the audit log has fsynced, delivers them, then saves its cursor (`<audit_log>.<name>.cursor`, written atomically and fsynced). The cursor is bound to the log's `log_id`, the destination, and the last delivered entry's seq and MAC. A cursor for another log or destination starts over from the first entry. If the log no longer continues from the cursor (it was rewritten or replaced), or the cursor or the destination is ahead of the log (it was truncated), the sink stops with an error in `bouncer status` and `doctor` instead of skipping, re-sending or waiting. A sink thread that dies is restarted, with backoff from 1 second to 5 minutes; failed deliveries back off the same way. Requests never wait for the network.
 
-Delivery is at least once: an entry delivered just before a crash, but after the last cursor save, is sent again on restart. Entries carry `seq`, `log_id` and `mac`, so receivers can de-duplicate, and each sink carries the head of the log with it.
+An entry a destination refuses for good (InfluxDB rejecting that one line, a syslog socket refusing even a short summary) is quarantined: the sink records it in its status and in a `sink_reject` audit entry, and moves on. More than three refusals in a row look like a configuration problem, so the sink stops instead.
+
+Delivery is at least once: an entry delivered just before a crash, but after the last cursor save, is sent again on restart. Every sink sends each entry's `seq`, `log_id` and `mac` (and InfluxDB `prev` too), so receivers can de-duplicate and check the chain, and each carries the head of the log with it.
 
 `bouncer status` shows each sink's last delivered seq, lag behind the head, last success and last error. `bouncer doctor` flags sinks with errors.
 
 | type | what it does |
 |---|---|
-| `s3` | One object per entry, `<prefix>/<host>/YYYY/MM/DD/<log_id>-<seq>.json`. Signed with AWS SigV4 (implemented in `src/sink/s3.rs` on `hmac` and `sha2`), with `Content-MD5`, which Object Lock requires. Only HTTP 200 and 201 count as success; redirects are not followed. With `conditional_put = true` (default) uploads send `If-None-Match: *`, so the store refuses to replace an existing object, and a 412 answer is treated as "already delivered". If a provider rejects conditional writes, the error says to set `conditional_put = false`. Works with AWS S3, Cloudflare R2 (`region = "auto"`, endpoint `https://<account>.r2.cloudflarestorage.com`), iDrive E2, MinIO and others. |
-| `file` | Appends each line, unchanged, to another file and fsyncs it, for example on another disk. On restart it reads the mirror's last line so it does not append entries twice. |
-| `influxdb` | InfluxDB v2 `POST /api/v2/write` with line protocol, in batches of up to 500. Tags: `op`, `secret` (names), `decision`, `host`, `thread` (first context variable). Fields: `seq`, `reason`, `result`, `why`, `policy`, `attribution`, `uid`, `pid`, `log_id`. Values are escaped; newlines never reach the line protocol. |
+| `s3` | One object per entry, `<prefix>/<host>/YYYY/MM/DD/<log_id>-<seq>-<mac>.json`: the key names the entry's content. Signed with AWS SigV4 (implemented in `src/sink/s3.rs` on `hmac` and `sha2`), with `Content-MD5`, which Object Lock requires. Only HTTP 200 and 201 count as success; redirects are not followed. With `conditional_put = true` (default) uploads send `If-None-Match: *`, so the store refuses to replace an existing object. A 412 answer is counted as delivered only after a `HEAD` shows the existing object has this entry's MD5 as its ETag; an object with other content is a conflict, reported and never acknowledged. If `HEAD` is not allowed, or the ETag is not a plain MD5 (multipart uploads, SSE-KMS), the MAC in the key, which only the daemon can compute, is taken as proof. If a provider rejects conditional writes, the error says to set `conditional_put = false`. Works with AWS S3, Cloudflare R2 (`region = "auto"`, endpoint `https://<account>.r2.cloudflarestorage.com`), iDrive E2, MinIO and others. |
+| `file` | Appends each line, unchanged, to another file and fsyncs it, for example on another disk. A new mirror's directory is fsynced too. On restart it cuts a torn last line (an append interrupted by a crash), then checks that the mirror's last line is byte for byte the log's entry with that seq, so it neither appends entries twice nor appends after another log's lines. |
+| `influxdb` | InfluxDB v2 `POST /api/v2/write` with line protocol, in batches of up to 500. Tags: `op`, `secret` (names), `decision`, `host`, `thread` (first context variable), `log_id`. Fields: `seq`, `reason`, `result`, `why`, `policy`, `attribution`, `uid`, `pid`, `mac`, `prev`. Each point's timestamp is the entry's time in nanoseconds plus `seq % 1000000`, so entries in the same millisecond are separate points rather than overwriting each other. Escaping follows the line protocol spec: control characters become spaces in the measurement and tags, `,` `=` and space get a backslash, a backslash is doubled; string fields escape `"` and `\`, and newlines never reach the line protocol. A batch the server refuses with 400 or 422 is retried one line at a time, and the line it still refuses is quarantined. |
 | `http` | POSTs each entry's JSON line with `X-Bouncer-Seq` and `X-Bouncer-Log-Id`. With `hmac_secret_file`, also `X-Bouncer-Signature: sha256=<hex HMAC-SHA256(secret, body)>`. Any 2xx counts as delivered. |
-| `syslog` | RFC 5424 over the local datagram socket; on systemd machines this lands in the journal. Denials are logged at `notice`, everything else at `info`. Messages over 8 KiB are cut and marked. Local syslog can drop messages, so treat it as a view, not a copy. |
+| `syslog` | RFC 5424 over the local datagram socket; on systemd machines this lands in the journal. Denials are logged at `notice`, everything else at `info`. The structured data carries `seq`, `log_id` and `mac`. Messages are sized to the socket's send buffer, at most 8 KiB (macOS allows 2 KiB by default); an entry that does not fit is sent as a one-line summary pointing to the audit log. If the kernel still says the message is too large, the size is halved, down to 480 bytes, and then the entry is quarantined rather than retried forever. Sends time out after 2 seconds. Local syslog can drop messages, so treat it as a view, not a copy. |
 
-The S3 sink's key needs `s3:PutObject` on the prefix and nothing else. Object Lock in compliance mode is what stops anyone, including the bucket owner, from deleting or overwriting objects during the retention period; bouncer does not configure it, so set it on the bucket.
+The S3 sink's key needs `s3:PutObject` on the prefix; with `s3:GetObject` as well, it can check an existing object after a 412. Object Lock in compliance mode is what stops anyone, including the bucket owner, from deleting or overwriting objects during the retention period; bouncer does not configure it, so set it on the bucket.
 
 A new sink type implements the `Sink` trait in `src/sink/mod.rs` (`fingerprint`, `send`, optionally `batch_size` and `already_has`) and adds a config variant.
 
@@ -433,8 +441,8 @@ A new sink type implements the `Sink` trait in `src/sink/mod.rs` (`fingerprint`,
 - The generation counter goes up by one on every change and is recorded in the audit log, which is how a rolled-back vault is detected (see [Audit log](#audit-log)).
 - The key is 32 random bytes from the OS (`getrandom`), stored as 64 hex characters in a file (mode 0600 or 0400), an encrypted systemd credential, or wherever `key_command` gets it from. In memory it is wiped on drop.
 - The audit chain key is HMAC-SHA256(vault key, "bouncer audit chain v1"), so the vault key and the chain key are never used for the same thing.
-- Decrypted secrets, request and response buffers and the plaintext vault are wiped when dropped (`zeroize`). serde's internal buffers are not, and a secret released to a client is copied into that client's memory.
-- The daemon disables core dumps (`RLIMIT_CORE=0`), on Linux marks itself non-dumpable (`PR_SET_DUMPABLE=0`, which also stops same-uid `ptrace` and `/proc/<pid>/mem` reads), and locks its memory with `mlockall` so secrets are not swapped. Locking all future allocations needs a high `RLIMIT_MEMLOCK` (the system unit sets `LimitMEMLOCK=infinity`); with a low limit bouncer locks what it has at start-up and prints a warning. macOS has no working `mlockall` (its swap is encrypted); `deny_debugger = true` sets `PT_DENY_ATTACH`.
+- Decrypted secrets, request and response buffers, the plaintext vault, keys and the cipher state, the environment blocks read for attribution, and the derived S3 signing keys are wiped when dropped (`zeroize`). Buffers inside serde_json and the TLS stack, old allocations left behind when a buffer grows, and kernel socket buffers are not, and a secret released to a client is copied into that client's memory.
+- The daemon disables core dumps (`RLIMIT_CORE=0`) and on Linux marks itself non-dumpable (`PR_SET_DUMPABLE=0`, which also stops same-uid `ptrace` and `/proc/<pid>/mem` reads). Keeping secrets out of swap is best effort: on Linux it locks its memory with `mlockall`; locking all future allocations needs a high `RLIMIT_MEMLOCK` (the system unit sets `LimitMEMLOCK=infinity`), with a low limit bouncer locks only what it has at start-up, and if `mlockall` fails it prints a warning and carries on. macOS has no working `mlockall` (its swap is encrypted by default); `deny_debugger = true` sets `PT_DENY_ATTACH`.
 
 Vault file layout (version 2):
 
@@ -447,7 +455,7 @@ offset  size   field
 40      n+16   ciphertext and tag; associated data = bytes 0..16
 ```
 
-The plaintext is JSON: `{"secrets": {"NAME": {"value", "desc", "tags", "created", "updated"}}}`. Secret names and tags are 1 to 128 characters of `A-Z a-z 0-9 _ . - /`. Values are UTF-8 text of up to 256 KiB.
+The plaintext is JSON: `{"secrets": {"NAME": {"value", "desc", "tags", "created", "updated", "rev"}}}`, where `rev` is the generation that last wrote the secret. Secret names and tags are 1 to 128 characters of `A-Z a-z 0-9 _ . - /`. Values are UTF-8 text of up to 256 KiB.
 
 ## Threat model
 
@@ -456,11 +464,11 @@ bouncer provides accountability, and in dedicated-user mode it keeps your agents
 - **Same-uid callers can bypass it.** If the daemon runs as you, any process running as you can read the key and vault files, or attach a debugger to the daemon on macOS, without going through the socket. Use dedicated-user mode to make the socket the only way in for your agents.
 - **Root bypasses everything,** in every mode.
 - **The reason is whatever the agent says.** bouncer records it. The optional admission model judges it, but a model can be persuaded.
-- **Attribution is advisory.** The peer uid and pid come from the kernel. Session variables come from process environments, which whoever starts a process controls; see [Caller attribution](#caller-attribution).
+- **Attribution is advisory.** The peer uid and pid come from the kernel. Session variables come from process environments, which whoever starts a process controls, and a caller can exec into another program while it is attributed; see [Caller attribution](#caller-attribution).
 - **Released values are out of bouncer's hands.** `exec` redaction covers the child's stdout and stderr, only exact matches, each stream separately. It does not catch encoded or transformed values, or values the child writes to files or the network.
 - **The audit log is tamper-evident, not tamper-proof.** Without the key nobody can forge entries, and cutting the log back past a change is caught. Cutting off the last few reads is only caught against an anchored head or a sink. Anyone with the key can rewrite the whole log. Ship it to an Object Lock bucket if you need a copy the host cannot change.
 - **Argv is logged.** The chain records shortened argv of the caller and its ancestors. If a process was started with a secret on its command line, part of it can end up in the log.
-- **Memory.** Secrets live decrypted in the daemon's memory. Core dumps are off, memory is locked where possible and buffers are wiped on drop, but anyone who can read the daemon's memory (root, or its own uid on macOS) can read the secrets.
+- **Memory.** Secrets live decrypted in the daemon's memory. Core dumps are off, memory is locked where possible (best effort, Linux only) and bouncer's own buffers are wiped on drop, but anyone who can read the daemon's memory (root, or its own uid on macOS) can read the secrets.
 - **Denial of service.** An allowed uid can hold up to `max_connections` connections for `request_timeout_ms` each, or fill the disk the log is on, after which the daemon stops releasing secrets until repaired.
 
 ## Performance
@@ -469,10 +477,10 @@ Measured on an Apple M-series laptop (macOS, release build), with `examples/late
 
 | | p50 | p90 | p99 |
 |---|---|---|---|
-| socket `get` (connect, attribution, request, audit write, response) | 74 µs | 92 µs | 160 µs |
+| socket `get` (connect, attribution, request, audit write, response) | 87 µs | 100 µs | 170 µs |
 | `bouncer get` CLI, including process start-up | 2.1 ms | 2.5 ms | 3.8 ms |
 
-Version 0.1 measured 39 µs at p50 for the socket `get`. Most of the difference is walking the whole process tree for every request, without a cache, and checking the caller is unchanged afterwards. `audit_fsync = "strict"` adds an fsync per request (a few milliseconds on macOS). The admission check adds the model's response time.
+The socket row was measured again after the second hardening round; the previous release measured 85 µs and 155 µs on the same machine in the same session, so the difference is within noise. Version 0.1 measured 39 µs at p50 for the socket `get`. Most of the difference is walking the whole process tree for every request, without a cache, and checking the caller is unchanged afterwards. `audit_fsync = "strict"` adds an fsync per request (a few milliseconds on macOS). The admission check adds the model's response time.
 
 Run it yourself:
 

@@ -26,6 +26,7 @@ A local secret store for LLM agents that records, for every secret released, who
 - An agent that gives a misleading reason, or talks the admission model round. Both are recorded, not prevented.
 - Misuse of a secret after it is released: copying it, encoding it, sending it elsewhere. `exec` redaction only replaces exact values in the child's stdout and stderr.
 - Spoofed session variables. They come from process environments, which whoever starts a process controls. The log records every value it sees and the pid it came from.
+- A caller that execs into another program between connecting and being attributed. The pid and start time checks catch a caller that exits and is replaced, not an exec, which keeps both; the log then shows the program the caller became.
 - Removal of the most recent audit entries when no head was anchored and no sink is configured.
 - Copies of secrets that bouncer does not control: buffers inside serde_json and the TLS stack, the kernel's socket buffers, old allocations left behind when a buffer grows, and the memory of any client a secret was released to. Anyone who can read the daemon's memory (root, or on macOS its own user) can read the secrets.
 - A compromised host, kernel, or Rust toolchain and dependencies.

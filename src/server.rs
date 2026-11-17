@@ -1,15 +1,18 @@
 //! The daemon: holds the decrypted vault in memory and answers requests on a Unix socket.
 //!
 //! Per connection: the peer's uid is checked right after accept, and connections from other
-//! uids are closed before anything is read. Then the caller is attributed (before the
-//! request is read, so it cannot exit or exec first), the request is read against one
-//! deadline, decided, written to the audit log, and only then answered. If the audit write
-//! fails, nothing is released and the daemon stays in a failed state until repaired.
+//! uids are closed before anything is read. Then a worker attributes the caller (before the
+//! request is read; a caller that exits and is replaced is caught, one that execs is not),
+//! the request is read against one deadline, decided, written to the audit log, and only
+//! then answered. If the audit write fails, nothing is released and the daemon stays in a
+//! failed state, recorded on disk, until repaired.
 //!
 //! Mutations are serialised: the audit entry (with a transaction id, the new vault
 //! generation and the new file's hash) is written first, then the vault file, then the
-//! in-memory copy is swapped. If saving fails, an `abort` entry records it and the in-memory
-//! vault is unchanged, so readers never see a change that is not in the log.
+//! in-memory copy is swapped. If saving fails before the rename, an `abort` entry records
+//! it and the in-memory vault is unchanged, so readers never see a change that is not in the
+//! log. If it fails after the rename, `commit_uncertain` is recorded, the daemon latches, and
+//! the next start-up lets the vault file decide (see `check_vault_state`).
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
