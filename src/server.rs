@@ -1252,6 +1252,24 @@ impl Server {
         self.vault_dir.replace(&self.vault_name, bytes, 0o600)
     }
 
+    /// How callers are attributed, and whether that works.
+    fn attribution_health(&self) -> serde_json::Value {
+        match &self.attr {
+            AttrSource::Local(_) => serde_json::json!({"mode": "in-process"}),
+            #[cfg(target_os = "linux")]
+            AttrSource::Inspector(i) => match i.health() {
+                None => serde_json::json!({"mode": "helper"}),
+                Some(why) => serde_json::json!({
+                    "mode": "helper",
+                    "error": format!(
+                        "the attribution helper is down ({why}); get and exec are denied while \
+                         require_attribution = true. Restart the service to start a new one"
+                    ),
+                }),
+            },
+        }
+    }
+
     fn status(&self) -> Response {
         let head = self.shared.head();
         let sinks: Vec<serde_json::Value> = self
@@ -1291,6 +1309,8 @@ impl Server {
                 "model": a.model,
                 "on_error": if a.on_error_allow { "allow" } else { "deny" },
             })),
+            "attribution": self.attribution_health(),
+            "checks": crate::checks::files(&self.cfg, util::geteuid()),
             "rejected_connections": self.rejected_total.load(Ordering::Relaxed),
             "inflight": self.inflight.load(Ordering::Relaxed),
         });

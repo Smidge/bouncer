@@ -6,6 +6,7 @@ pub mod util;
 #[cfg(feature = "net")]
 pub mod admission;
 pub mod audit;
+pub mod checks;
 pub mod config;
 pub mod harden;
 pub mod peer;

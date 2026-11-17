@@ -168,10 +168,11 @@ impl Env {
             .collect()
     }
 
-    /// Sends raw bytes and returns the raw answer.
+    /// Sends raw bytes and returns the raw answer. The daemon may answer (busy, denied) and
+    /// close before reading, so a failed write still reads the answer.
     fn raw(&self, req: &[u8]) -> String {
         let mut s = UnixStream::connect(self.sock()).unwrap();
-        s.write_all(req).unwrap();
+        let _ = s.write_all(req);
         let mut resp = String::new();
         let _ = s.read_to_string(&mut resp);
         resp
@@ -1054,6 +1055,59 @@ fn doctor_reports_problems() {
     let out = env.run(&["doctor"], None, &[]);
     assert_eq!(out.status.code(), Some(8), "{}", stdout(&out));
     assert!(stdout(&out).contains("FAIL"));
+}
+
+#[test]
+fn doctor_judges_the_daemon_uid_and_says_what_it_cannot_check() {
+    // The daemon is meant to run as another uid: doctor, running as us, cannot check its
+    // files and must not print a green report about them.
+    let env = Env::init(&format!("server_uid = {}\n", uid() + 1));
+    let out = env.run(&["doctor"], None, &[]);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(8), "{text}");
+    assert!(text.contains("Run doctor as the service user"), "{text}");
+    assert!(!text.contains("ok    vault"), "{text}");
+    // Run as the daemon's uid, the same files are judged against that uid.
+    let out = env.run(
+        &["doctor"],
+        None,
+        &[("BOUNCER_SERVER_UID", &uid().to_string())],
+    );
+    assert!(stdout(&out).contains("ok    vault"), "{}", stdout(&out));
+
+    // A systemd credential is not claimed to be encrypted at rest.
+    let creds = env.dir.join("creds");
+    fs::create_dir(&creds).unwrap();
+    fs::write(creds.join("bouncer-key"), "ab".repeat(32)).unwrap();
+    fs::set_permissions(creds.join("bouncer-key"), fs::Permissions::from_mode(0o400)).unwrap();
+    fs::write(
+        env.dir.join("config.toml"),
+        "key_credential = \"bouncer-key\"\n",
+    )
+    .unwrap();
+    let out = env.run(
+        &["doctor"],
+        None,
+        &[("CREDENTIALS_DIRECTORY", creds.to_str().unwrap())],
+    );
+    let text = stdout(&out);
+    assert!(text.contains("doctor cannot tell"), "{text}");
+    assert!(!text.contains("not stored readable on disk"), "{text}");
+
+    // The daemon reports the same checks in status, for doctor run by other users.
+    fs::write(env.dir.join("config.toml"), "").unwrap();
+    let mut env = env;
+    env.serve(&[]);
+    let st: serde_json::Value =
+        serde_json::from_str(&stdout(&env.run(&["status", "--json"], None, &[]))).unwrap();
+    let checks = st["checks"].as_array().unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|c| c["level"] == "ok" && c["msg"].as_str().unwrap().starts_with("vault ")),
+        "{checks:?}"
+    );
+    assert_eq!(st["attribution"]["mode"], "in-process");
 }
 
 #[test]

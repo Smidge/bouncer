@@ -1,10 +1,15 @@
 //! `bouncer doctor`: checks the deployment and prints actionable warnings.
+//!
+//! Ownership is judged against the uid the daemon runs as (`user`, else `server_uid`), not
+//! the uid doctor runs as. The checks of the daemon's own files need that uid (or root);
+//! run as anyone else, doctor uses the same checks as run by the daemon (`status`), or says
+//! plainly that it could not make them.
 
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::Path;
 use std::time::Duration;
 
-use bouncer::config::{Config, KeySource, SecretRef, SinkKind};
+use bouncer::checks::{self, Check, Level};
+use bouncer::config::{Config, SinkKind};
 use bouncer::proto::{self, CallError, Op, Request};
 use bouncer::util::{self, Result, escape};
 
@@ -29,85 +34,22 @@ impl Report {
     fn note(&self, msg: impl AsRef<str>) {
         println!("  note  {}", msg.as_ref());
     }
-}
-
-/// Checks that no ancestor directory of `path` can be written by another user (which would
-/// let them swap the path out).
-fn check_ancestors(r: &mut Report, path: &Path) {
-    let me = util::geteuid();
-    let mut p = path.parent();
-    while let Some(dir) = p {
-        if dir.as_os_str().is_empty() {
-            break;
+    fn check(&mut self, c: &Check, suffix: &str) {
+        let m = format!("{}{suffix}", c.msg);
+        match c.level {
+            Level::Ok => self.ok(m),
+            Level::Note => self.note(m),
+            Level::Warn => self.warn(m),
+            Level::Fail => self.bad(m),
         }
-        if let Ok(m) = std::fs::metadata(dir) {
-            let writable_by_others = m.mode() & 0o022 != 0 && m.mode() & 0o1000 == 0;
-            let owner_ok = m.uid() == 0 || m.uid() == me;
-            if !owner_ok || writable_by_others {
-                r.bad(format!(
-                    "{} (a parent of {}) is owned by uid {} with mode {:04o}; another user could replace what is below it",
-                    dir.display(),
-                    path.display(),
-                    m.uid(),
-                    m.mode() & 0o7777
-                ));
-                return;
-            }
-        }
-        p = dir.parent();
     }
 }
 
-/// A file the daemon owns (vault, log): owner, mode, and the directory around it.
-fn check_data(r: &mut Report, what: &str, path: &Path) {
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            r.note(format!("{what} {}: cannot inspect as uid {} (permission denied); run doctor as the daemon's user for full checks", path.display(), util::geteuid()));
-            return;
-        }
-        Err(e) => {
-            r.bad(format!("{what} {}: {e}", path.display()));
-            return;
-        }
-        Ok(m) if m.file_type().is_symlink() => {
-            r.bad(format!(
-                "{what} {} is a symlink; bouncer refuses to follow it",
-                path.display()
-            ));
-            return;
-        }
-        Ok(m) => match util::check_data_file(&m, path) {
-            Ok(()) => r.ok(format!(
-                "{what} {} (uid {}, mode {:04o})",
-                path.display(),
-                m.uid(),
-                m.mode() & 0o7777
-            )),
-            Err(e) => r.bad(format!("{what}: {e}")),
-        },
-    }
-    if let Some(dir) = path.parent()
-        && let Ok(m) = std::fs::symlink_metadata(dir)
-        && let Err(e) = util::check_dir(&m, dir, true)
-    {
-        r.bad(e.0);
-    }
-    check_ancestors(r, path);
-}
-
-fn check_secret(r: &mut Report, what: &str, s: &SecretRef) {
-    match s.path() {
-        Err(_) => r.note(format!("{what}: {} is only readable inside the systemd unit ($CREDENTIALS_DIRECTORY is not set here)", s.describe())),
-        Ok(p) => match std::fs::symlink_metadata(&p) {
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                r.note(format!("{what} {}: cannot inspect (permission denied)", p.display()))
-            }
-            Err(e) => r.bad(format!("{what} {}: {e}", p.display())),
-            Ok(m) => match util::check_secret_mode(&m, &p, matches!(s, SecretRef::Credential(_))) {
-                Ok(()) => r.ok(format!("{what} {} (mode {:04o})", p.display(), m.mode() & 0o7777)),
-                Err(e) => r.bad(format!("{what}: {e}")),
-            },
-        },
+/// The uid the daemon runs as: the `user` it drops to, else `server_uid`.
+fn daemon_uid(cfg: &Config) -> Result<u32> {
+    match &cfg.user {
+        Some(u) => bouncer::config::lookup_user(u).map(|(uid, _)| uid),
+        None => Ok(cfg.server_uid),
     }
 }
 
@@ -115,9 +57,23 @@ pub fn run(cfg: &Config) -> Result<i32> {
     let mut r = Report::default();
     let me = util::geteuid();
     println!("bouncer doctor (running as uid {me})\n\nconfig");
+    let daemon = match daemon_uid(cfg) {
+        Ok(u) => u,
+        Err(e) => {
+            r.bad(format!("cannot tell which uid the daemon runs as: {e}"));
+            me
+        }
+    };
+    r.ok(format!(
+        "the daemon runs as uid {daemon}{}",
+        match &cfg.user {
+            Some(u) => format!(" (user = \"{}\")", escape(u)),
+            None => " (server_uid)".into(),
+        }
+    ));
     match std::fs::metadata(&cfg.config_file) {
-        Ok(m) if !util::trusted_owner(m.uid()) => r.bad(format!(
-            "{} is owned by uid {}; only you or root should be able to change it",
+        Ok(m) if m.uid() != 0 && m.uid() != daemon => r.bad(format!(
+            "{} is owned by uid {}; only root or the daemon's uid {daemon} should be able to change it",
             cfg.config_file.display(),
             m.uid()
         )),
@@ -136,43 +92,36 @@ pub fn run(cfg: &Config) -> Result<i32> {
         r.note("uid 0 is listed in allowed_uids/admin_uids; root can read everything anyway");
     }
 
-    println!("\nkey");
-    let same_user;
-    match &cfg.key {
-        KeySource::File(p) => {
-            check_secret(&mut r, "key file", &SecretRef::File(p.clone()));
-            check_ancestors(&mut r, p);
-            let key_owner = std::fs::metadata(p).map(|m| m.uid()).ok();
-            let vault_owner = std::fs::metadata(&cfg.vault).map(|m| m.uid()).ok();
-            same_user = key_owner.is_some() && key_owner == vault_owner;
-            if same_user {
-                r.warn(format!(
-                    "the key and the vault are both readable by uid {}: anything running as that user can decrypt the vault without asking bouncer. \
-                     Encryption then protects only copies (backups, sync) and other users. Use dedicated-user mode \
-                     (README) and/or key_credential to keep agents away from the files",
-                    key_owner.unwrap_or(0)
-                ));
+    // Asked first: in dedicated-user mode the file checks come from here.
+    let status = proto::call(
+        &cfg.socket,
+        cfg.server_uid,
+        &Request::new(Op::Status, vec![], String::new()),
+        Duration::from_secs(5),
+    );
+
+    println!("\nkey and data files");
+    if me == daemon || me == 0 {
+        for c in checks::files(cfg, daemon) {
+            r.check(&c, "");
+        }
+    } else {
+        match status.as_ref().ok().and_then(|s| s.status.as_ref()) {
+            Some(st) if st["checks"].is_array() => {
+                let list: Vec<Check> =
+                    serde_json::from_value(st["checks"].clone()).unwrap_or_default();
+                for c in &list {
+                    r.check(c, " (checked by the daemon)");
+                }
             }
-        }
-        KeySource::Credential(n) => {
-            same_user = false;
-            check_secret(&mut r, "key", &SecretRef::Credential(n.clone()));
-            r.ok("key comes from a systemd credential (not stored readable on disk)");
-        }
-        KeySource::Command(a) => {
-            same_user = false;
-            r.ok(format!(
-                "key comes from `{}` (not run by doctor)",
-                escape(&a.join(" "))
-            ));
-            r.note("any process running as the daemon's user can usually run the same command");
+            _ => r.bad(format!(
+                "cannot check the key, vault and log as uid {me}, and the daemon did not report them. \
+                 Run doctor as the service user (uid {daemon}), for example: \
+                 sudo -u '#{daemon}' env BOUNCER_CONFIG={} bouncer doctor",
+                cfg.config_file.display()
+            )),
         }
     }
-    let _ = same_user;
-
-    println!("\ndata");
-    check_data(&mut r, "vault", &cfg.vault);
-    check_data(&mut r, "audit log", &cfg.audit_log);
 
     println!("\nsocket");
     match std::fs::symlink_metadata(&cfg.socket) {
@@ -199,6 +148,27 @@ pub fn run(cfg: &Config) -> Result<i32> {
                     cfg.server_uid
                 ));
             }
+            // Callers other than the daemon's uid need group or other access.
+            let mut callers: Vec<u32> = cfg
+                .allowed_uids
+                .iter()
+                .chain(&cfg.admin_uids)
+                .copied()
+                .filter(|&u| u != m.uid() && u != 0)
+                .collect();
+            callers.sort_unstable();
+            callers.dedup();
+            if !callers.is_empty() && mode & 0o066 == 0 {
+                r.bad(format!(
+                    "uid(s) {callers:?} may connect (allowed_uids/admin_uids), but the socket's mode {mode:04o} only lets its owner in; \
+                     set socket_mode = \"0660\" and socket_group"
+                ));
+            } else if !callers.is_empty() && mode & 0o006 == 0 {
+                r.note(format!(
+                    "uid(s) {callers:?} reach the socket through its group (gid {}); they must be members of it",
+                    m.gid()
+                ));
+            }
         }
         Err(e) => r.warn(format!(
             "{}: {e} (is the daemon running?)",
@@ -207,19 +177,14 @@ pub fn run(cfg: &Config) -> Result<i32> {
     }
     if let Some(dir) = cfg.socket.parent()
         && let Ok(m) = std::fs::symlink_metadata(dir)
-        && let Err(e) = util::check_dir(&m, dir, false)
-        && m.uid() == me
+        && let Err(e) = util::check_dir_as(&m, dir, false, daemon)
+        && m.uid() != 0
     {
         r.bad(e.0);
     }
 
     println!("\ndaemon");
-    let st = match proto::call(
-        &cfg.socket,
-        cfg.server_uid,
-        &Request::new(Op::Status, vec![], String::new()),
-        Duration::from_secs(5),
-    ) {
+    let st = match status {
         Ok(resp) if resp.ok => resp.status.clone(),
         Ok(resp) => {
             r.bad(format!(
@@ -244,11 +209,22 @@ pub fn run(cfg: &Config) -> Result<i32> {
             st["uid"],
             st["audit"]["head"].as_str().unwrap_or("?")
         ));
+        if st["uid"].as_u64() != Some(u64::from(daemon)) {
+            r.bad(format!(
+                "the daemon runs as uid {}, but the config says uid {daemon}",
+                st["uid"]
+            ));
+        }
         if let Some(f) = st["audit"]["failed"].as_str() {
             r.bad(format!(
                 "the audit log has failed: {}; run `bouncer repair` and restart",
                 escape(f)
             ));
+        }
+        if let Some(e) = st["attribution"]["error"].as_str() {
+            r.bad(escape(e));
+        } else if st["attribution"]["mode"] == "helper" {
+            r.ok("attribution helper is running");
         }
         for s in st["sinks"].as_array().into_iter().flatten() {
             let name = s["name"].as_str().unwrap_or("?");
@@ -270,9 +246,9 @@ pub fn run(cfg: &Config) -> Result<i32> {
                 )),
             }
         }
-        if st["uid"].as_u64() == Some(u64::from(me)) && me != 0 {
-            r.warn("the daemon runs as your own uid (same-user mode): it is accountability, not isolation. See \"Deployment modes\" in the README");
-        }
+    }
+    if daemon != 0 && cfg.allowed_uids.iter().all(|&u| u == daemon) {
+        r.warn("the daemon and its callers share a uid (same-user mode): it is accountability, not isolation. See \"Deployment modes\" in the README");
     }
 
     println!("\nsinks");
@@ -283,8 +259,6 @@ pub fn run(cfg: &Config) -> Result<i32> {
         r.ok(format!("{} ({})", s.name, s.kind.type_name()));
         match &s.kind {
             SinkKind::S3(c) => {
-                check_secret(&mut r, "  access key id", &c.access_key_id);
-                check_secret(&mut r, "  secret access key", &c.secret_access_key);
                 if c.endpoint.starts_with("http://") {
                     r.warn(format!("  {} uses plain http", s.name));
                 }
@@ -292,22 +266,15 @@ pub fn run(cfg: &Config) -> Result<i32> {
                     r.note(format!("  {}: conditional_put = false; rely on Object Lock or versioning to keep objects from being replaced", s.name));
                 }
             }
-            SinkKind::Influx(c) => check_secret(&mut r, "  token", &c.token),
-            SinkKind::Http(c) => {
-                if let Some(h) = &c.hmac_secret {
-                    check_secret(&mut r, "  hmac secret", h);
-                } else {
-                    r.note(format!(
-                        "  {}: no hmac_secret, so the receiver cannot authenticate entries",
-                        s.name
-                    ));
-                }
-            }
-            SinkKind::File { path } => check_ancestors(&mut r, path),
+            SinkKind::Http(c) if c.hmac_secret.is_none() => r.note(format!(
+                "  {}: no hmac_secret, so the receiver cannot authenticate entries",
+                s.name
+            )),
             SinkKind::Syslog(_) => r.note(format!(
                 "  {}: syslog is best effort and can drop messages",
                 s.name
             )),
+            _ => {}
         }
     }
 
@@ -321,7 +288,6 @@ pub fn run(cfg: &Config) -> Result<i32> {
                 escape(&a.model),
                 escape(&a.endpoint)
             ));
-            check_secret(&mut r, "api key", &a.api_key);
             if a.on_error_allow {
                 r.warn("on_error = \"allow\": secrets are released when the model is unreachable");
             }

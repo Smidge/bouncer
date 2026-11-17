@@ -285,6 +285,23 @@ pub fn check_secret_mode(meta: &fs::Metadata, path: &Path, systemd_credential: b
     )
 }
 
+/// `check_secret_mode` as the daemon running as `uid` would see it (for `doctor`).
+pub fn check_secret_mode_as(
+    meta: &fs::Metadata,
+    path: &Path,
+    systemd_credential: bool,
+    uid: u32,
+) -> Result<()> {
+    check_secret_meta(
+        meta.file_type().is_file(),
+        meta.uid(),
+        meta.mode(),
+        path,
+        systemd_credential,
+        uid,
+    )
+}
+
 fn check_secret_meta(
     regular: bool,
     owner: u32,
@@ -322,15 +339,19 @@ fn check_secret_meta(
 /// Checks a data file bouncer writes (vault, audit log): regular, owned by us, no access for
 /// group or others.
 pub fn check_data_file(meta: &fs::Metadata, path: &Path) -> Result<()> {
+    check_data_file_as(meta, path, geteuid())
+}
+
+/// `check_data_file` for a daemon running as `uid`.
+pub fn check_data_file_as(meta: &fs::Metadata, path: &Path, uid: u32) -> Result<()> {
     if !meta.file_type().is_file() {
         return Err(err!("{} is not a regular file", path.display()));
     }
-    if meta.uid() != geteuid() {
+    if meta.uid() != uid {
         return Err(err!(
-            "{} is owned by uid {}, not by this daemon's uid {}",
+            "{} is owned by uid {}, not by the daemon's uid {uid}",
             path.display(),
             meta.uid(),
-            geteuid()
         ));
     }
     if meta.mode() & 0o077 != 0 {
@@ -601,15 +622,19 @@ pub enum WriteError {
 
 /// Checks a directory's metadata (see `Dir::secure`).
 pub fn check_dir(meta: &fs::Metadata, path: &Path, private: bool) -> Result<()> {
+    check_dir_as(meta, path, private, geteuid())
+}
+
+/// `check_dir` for a daemon running as `uid`.
+pub fn check_dir_as(meta: &fs::Metadata, path: &Path, private: bool, uid: u32) -> Result<()> {
     if !meta.file_type().is_dir() {
         return Err(err!("{} is not a directory", path.display()));
     }
-    if meta.uid() != geteuid() {
+    if meta.uid() != uid {
         return Err(err!(
-            "directory {} is owned by uid {}, not by uid {}; refusing to use it",
+            "directory {} is owned by uid {}, not by uid {uid}; refusing to use it",
             path.display(),
             meta.uid(),
-            geteuid()
         ));
     }
     let mode = meta.mode() & 0o7777;

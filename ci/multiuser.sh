@@ -8,7 +8,10 @@
 #
 # Then checks that the daemon dropped to the bouncer user with no capabilities, that an
 # `agent` user can fetch a secret and is attributed across uids, and that the agent cannot
-# read the vault, key or log, change secrets, or be fooled by a socket it planted.
+# read the vault, key or log, change secrets, or be fooled by a socket it planted. Also that
+# a sink credential owned by the bouncer user is accepted at start-up (while still root),
+# that doctor works for both users, and that a dead attribution helper is reported and
+# fails closed. Needs python3 (for a local webhook receiver).
 set -eu
 
 BIN=${1:-target/release/bouncer}
@@ -31,6 +34,23 @@ if [ "$MODE" = systemd ]; then
 else
     KEYLINE='key = "/var/lib/bouncer/key"'
 fi
+
+# A webhook receiver, and its HMAC secret owned by the service user (read as root at start).
+cat > /tmp/hook.py <<'EOF2'
+import http.server
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("content-length", 0)))
+        self.send_response(200)
+        self.end_headers()
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(("127.0.0.1", 18089), H).serve_forever()
+EOF2
+python3 /tmp/hook.py &
+printf %s fake-hook-secret > /etc/bouncer/hook-secret
+chown bouncer:bouncer /etc/bouncer/hook-secret
+chmod 0600 /etc/bouncer/hook-secret
 cat > /etc/bouncer/config.toml <<EOF
 user = "bouncer"
 socket = "/run/bouncer/bouncer.sock"
@@ -43,6 +63,12 @@ vault = "/var/lib/bouncer/vault.bin"
 audit_log = "/var/lib/bouncer/audit.jsonl"
 $KEYLINE
 context_vars = ["AGENT_THREAD"]
+
+[[sink]]
+type = "http"
+url = "http://127.0.0.1:18089/hook"
+allow_insecure_http = true
+hmac_secret_file = "/etc/bouncer/hook-secret"
 EOF
 chmod 0644 /etc/bouncer/config.toml
 export BOUNCER_CONFIG=/etc/bouncer/config.toml
@@ -138,4 +164,43 @@ fi
 
 su -s /bin/sh bouncer -c "BOUNCER_CONFIG=$BOUNCER_CONFIG bouncer --socket /run/bouncer/admin.sock verify-log --daemon"
 ok "audit log verifies (keyed, by the daemon)"
+
+# The webhook sink started with a credential file owned by the service user.
+delivered() {
+    as_agent "bouncer status --json" | python3 -c 'import json, sys
+s = json.load(sys.stdin)
+sys.exit(0 if any(k["type"] == "http" and k.get("last_success") for k in s["sinks"]) else 1)'
+}
+for i in $(seq 50); do delivered && break; sleep 0.1; done
+delivered || fail "webhook sink did not deliver: $(as_agent 'bouncer status')"
+ok "sink credential owned by the service user accepted; webhook delivered"
+
+# doctor: as the service user it checks the files itself; as the agent it reports the
+# daemon's own checks instead of a report about files it cannot see.
+su -s /bin/sh bouncer -c "BOUNCER_CONFIG=$BOUNCER_CONFIG bouncer doctor" > /tmp/doctor-bouncer.out || { cat /tmp/doctor-bouncer.out; fail "doctor as bouncer"; }
+grep -q "ok    vault /var/lib/bouncer/vault.bin" /tmp/doctor-bouncer.out || { cat /tmp/doctor-bouncer.out; fail "doctor as bouncer did not check the vault"; }
+grep -q "attribution helper is running" /tmp/doctor-bouncer.out || { cat /tmp/doctor-bouncer.out; fail "doctor did not see the helper"; }
+as_agent "bouncer doctor" > /tmp/doctor-agent.out || { cat /tmp/doctor-agent.out; fail "doctor as agent"; }
+grep -q "vault /var/lib/bouncer/vault.bin .* (checked by the daemon)" /tmp/doctor-agent.out || { cat /tmp/doctor-agent.out; fail "doctor as agent did not use the daemon's checks"; }
+ok "doctor checks files as the service user, and through the daemon for the agent"
+
+# A dead attribution helper: reported by status and doctor, and get fails closed.
+helper=""
+for pid in $(pgrep -x bouncer); do
+    [ "$(awk '/^CapEff:/ {print $2}' /proc/$pid/status)" = 0000000000080004 ] && helper=$pid
+done
+[ -n "$helper" ] || fail "no helper process"
+kill -9 "$helper"
+sleep 0.5
+set +e
+as_agent "bouncer get DEMO --reason 'helper is gone'" >/tmp/get.out 2>/tmp/get.err; rc=$?
+set -e
+[ $rc -eq 3 ] || fail "get with a dead helper exited $rc: $(cat /tmp/get.err)"
+[ ! -s /tmp/get.out ] || fail "a secret was released without attribution"
+as_agent "bouncer status" | grep -q "ATTRIBUTION: the attribution helper is down" || fail "status does not report the dead helper"
+set +e
+su -s /bin/sh bouncer -c "BOUNCER_CONFIG=$BOUNCER_CONFIG bouncer doctor" > /tmp/doctor-dead.out; rc=$?
+set -e
+[ $rc -eq 8 ] && grep -q "FAIL  the attribution helper is down" /tmp/doctor-dead.out || { cat /tmp/doctor-dead.out; fail "doctor does not report the dead helper"; }
+ok "a dead helper is reported by status and doctor, and get is denied"
 echo "all multi-user checks passed"

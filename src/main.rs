@@ -925,6 +925,9 @@ fn cmd_status(cfg: &Config, mut args: Args) -> Result<i32> {
     if let Some(f) = st["audit"]["failed"].as_str() {
         println!("AUDIT LOG FAILED: {}", escape(f));
     }
+    if let Some(e) = st["attribution"]["error"].as_str() {
+        println!("ATTRIBUTION: {}", escape(e));
+    }
     for k in st["sinks"].as_array().into_iter().flatten() {
         println!(
             "sink       {} ({}): delivered seq {}, lag {}, last success {}, last error {}",
