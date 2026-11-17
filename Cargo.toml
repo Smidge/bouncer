@@ -18,7 +18,8 @@ net = ["dep:ureq", "dep:md-5"]
 s3 = ["net"]
 
 [dependencies]
-chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
+# `zeroize` wipes the cipher's key schedule and state when dropped.
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 getrandom = "0.4.3"
 # HMAC-SHA256 for the keyed audit chain, SigV4 and webhook signatures.
 hmac = "0.13.0"

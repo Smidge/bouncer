@@ -15,8 +15,13 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::util::cap;
+
+/// A process's environment, one `NAME=value` per item. Other processes' environments can hold
+/// secrets, so every copy is wiped when dropped.
+pub(crate) type Env = Zeroizing<Vec<Vec<u8>>>;
 
 /// Ancestors walked before giving up (recorded as `chain_truncated`).
 pub const HARD_DEPTH: usize = 512;
@@ -211,7 +216,7 @@ impl Attributor {
             } else if !env_ok && b.uid.is_some() && b.uid == first_uid {
                 unreadable_same_uid = true;
             }
-            for entry in env.iter().flatten() {
+            for entry in env.iter().flat_map(|e| e.iter()) {
                 let Some(eq) = entry.iter().position(|&c| c == b'=') else {
                     continue;
                 };
@@ -303,11 +308,12 @@ fn short_argv(args: &[String]) -> String {
 
 #[cfg(target_os = "linux")]
 mod sys {
-    use super::{Basic, PeerCred};
+    use super::{Basic, Env, PeerCred};
     use std::fs;
     use std::io;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::MetadataExt;
+    use zeroize::Zeroizing;
 
     pub fn peer_cred(fd: i32) -> io::Result<PeerCred> {
         // SAFETY: ucred is plain data and len matches its size.
@@ -394,18 +400,16 @@ mod sys {
             .collect()
     }
 
-    pub fn args_env(pid: i32) -> (Option<Vec<String>>, Option<Vec<Vec<u8>>>) {
+    pub fn args_env(pid: i32) -> (Option<Vec<String>>, Option<Env>) {
         let args = fs::read(format!("/proc/{pid}/cmdline")).ok().map(|d| {
             split_nul(&d)
                 .iter()
                 .map(|a| String::from_utf8_lossy(a).into_owned())
                 .collect()
         });
-        let env = fs::read(format!("/proc/{pid}/environ")).ok().map(|mut d| {
-            let v = split_nul(&d);
-            zeroize::Zeroize::zeroize(&mut d);
-            v
-        });
+        let env = fs::read(format!("/proc/{pid}/environ"))
+            .ok()
+            .map(|d| Zeroizing::new(split_nul(&Zeroizing::new(d))));
         (args, env)
     }
 
@@ -424,7 +428,7 @@ mod sys {
 
 #[cfg(target_os = "macos")]
 mod sys {
-    use super::{Basic, PeerCred};
+    use super::{Basic, Env, PeerCred};
     use std::cell::RefCell;
     use std::io;
     use std::mem::{size_of, zeroed};
@@ -517,7 +521,7 @@ mod sys {
 
     /// argv and environment via `sysctl(KERN_PROCARGS2)`; only works for same-uid processes
     /// (or as root).
-    pub fn args_env(pid: i32) -> (Option<Vec<String>>, Option<Vec<Vec<u8>>>) {
+    pub fn args_env(pid: i32) -> (Option<Vec<String>>, Option<Env>) {
         BUF.with_borrow_mut(|buf| {
             if buf.len() < argmax() {
                 buf.resize(argmax(), 0);
@@ -539,7 +543,7 @@ mod sys {
                 return (None, None);
             }
             let r = parse_procargs(&buf[..size])
-                .map(|(a, e)| (Some(a), Some(e)))
+                .map(|(a, e)| (Some(a), Some(zeroize::Zeroizing::new(e))))
                 .unwrap_or((None, None));
             zeroize::Zeroize::zeroize(&mut buf[..size]);
             r
@@ -614,6 +618,16 @@ mod tests {
         assert!(s.len() < 8 * 90 + 10);
         assert!(s.ends_with(" ..."));
         assert_eq!(short_argv(&["a".into(), "b c".into()]), "a b c");
+    }
+
+    /// Environment copies (other processes' secrets) and the vault cipher wipe themselves.
+    #[test]
+    fn copies_of_secrets_are_wiped_on_drop() {
+        fn wiped<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+        let (_, env) = sys::args_env(std::process::id() as i32);
+        wiped(&env.expect("own environment is readable"));
+        use chacha20poly1305::aead::KeyInit;
+        wiped(&chacha20poly1305::XChaCha20Poly1305::new(&[0u8; 32].into()));
     }
 
     #[test]

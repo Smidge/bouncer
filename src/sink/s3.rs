@@ -74,13 +74,14 @@ pub fn authorization(r: &SignRequest, creds: &Credentials) -> String {
         r.amz_date,
         util::sha256_hex(canonical.as_bytes())
     );
-    let k = hmac(
+    // Each derived key is as good as the secret for a day, so all are wiped.
+    let k = Zeroizing::new(hmac(
         Zeroizing::new(format!("AWS4{}", *creds.secret_access_key)).as_bytes(),
         date.as_bytes(),
-    );
-    let k = hmac(&k, r.region.as_bytes());
-    let k = hmac(&k, r.service.as_bytes());
-    let k = hmac(&k, b"aws4_request");
+    ));
+    let k = Zeroizing::new(hmac(&k, r.region.as_bytes()));
+    let k = Zeroizing::new(hmac(&k, r.service.as_bytes()));
+    let k = Zeroizing::new(hmac(&k, b"aws4_request"));
     let sig = util::hex(&hmac(&k, to_sign.as_bytes()));
     format!(
         "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed}, Signature={sig}",

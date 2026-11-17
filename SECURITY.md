@@ -15,7 +15,9 @@ A local secret store for LLM agents that records, for every secret released, who
 - Agents reading credentials from files, shell history or other projects: they ask bouncer instead, and every request is recorded with its reason.
 - In dedicated-user mode (Linux), agents running as your login user copying the vault, key or audit log, inspecting the daemon, or changing secrets. The daemon runs as its own user with no capabilities; a separate helper keeps only the two capabilities needed to read callers' environments.
 - Silent edits to the audit log by anyone without the vault key, rolled-back vault files, and audit logs cut back past a change. Removal of the most recent reads is caught against an anchored head or a sink.
-- Secrets in core dumps or swap (core dumps off; memory locked on Linux), and secret buffers left in freed memory (wiped on drop).
+- Secrets in core dumps: they are disabled (`RLIMIT_CORE=0`, and on Linux `PR_SET_DUMPABLE=0`).
+- Secrets in swap, on a best-effort basis. On Linux the daemon locks its memory with `mlockall` (`mlock = true`). With a high `RLIMIT_MEMLOCK` (the system unit sets `LimitMEMLOCK=infinity`) later allocations are locked too; with a low one only the memory present at start-up is locked, and if `mlockall` fails the daemon prints a warning and carries on. macOS has no working `mlockall`; it encrypts swap by default.
+- bouncer's own copies of secrets lingering after use: the vault plaintext, secret values, request and response buffers, keys, the cipher state, environment blocks read for attribution, and derived S3 signing keys are wiped when dropped.
 - A socket planted by another user: clients check the daemon's uid before sending anything.
 
 ## What it does not protect against
@@ -25,6 +27,7 @@ A local secret store for LLM agents that records, for every secret released, who
 - Misuse of a secret after it is released: copying it, encoding it, sending it elsewhere. `exec` redaction only replaces exact values in the child's stdout and stderr.
 - Spoofed session variables. They come from process environments, which whoever starts a process controls. The log records every value it sees and the pid it came from.
 - Removal of the most recent audit entries when no head was anchored and no sink is configured.
+- Copies of secrets that bouncer does not control: buffers inside serde_json and the TLS stack, the kernel's socket buffers, old allocations left behind when a buffer grows, and the memory of any client a secret was released to. Anyone who can read the daemon's memory (root, or on macOS its own user) can read the secrets.
 - A compromised host, kernel, or Rust toolchain and dependencies.
 
 Read "Threat model" and "Caller attribution" in the README for details.
