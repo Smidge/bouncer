@@ -117,7 +117,7 @@ pub struct Server {
     sinks: Vec<StatusHandle>,
     started: String,
     inflight: AtomicUsize,
-    pool: Pool,
+    pool: Pool<Job>,
     /// Test hook: the directory fsync after the vault rename fails.
     #[cfg(test)]
     fail_dir_sync: std::sync::atomic::AtomicBool,
@@ -573,23 +573,116 @@ fn answer_and_close(stream: &UnixStream, resp: Response) {
 }
 
 /// A pool of worker threads that grows on demand up to `max`.
-struct Pool {
-    tx: Mutex<mpsc::Sender<Job>>,
-    rx: Arc<Mutex<mpsc::Receiver<Job>>>,
-    idle: AtomicUsize,
+///
+/// A job goes to an existing worker only if one has announced it is idle and no other job has
+/// claimed that announcement yet (taken atomically by the submitter). Otherwise a new worker is
+/// started with the job, up to `max`. Only when all `max` workers are busy does a job wait in
+/// the queue, so a slow client never holds up a fast one while there is room for a worker.
+pub(crate) struct Pool<J> {
+    inner: Arc<PoolInner<J>>,
+    tx: Mutex<mpsc::Sender<J>>,
     total: AtomicUsize,
     max: usize,
 }
 
-impl Pool {
-    fn new(max: usize) -> Pool {
+struct PoolInner<J> {
+    rx: Mutex<mpsc::Receiver<J>>,
+    /// Workers waiting for a job that no submitter has claimed.
+    idle: AtomicUsize,
+    /// Jobs queued while every worker was busy, not yet claimed by a worker.
+    queued: AtomicUsize,
+}
+
+impl<J: Send + 'static> Pool<J> {
+    pub(crate) fn new(max: usize) -> Pool<J> {
         let (tx, rx) = mpsc::channel();
         Pool {
+            inner: Arc::new(PoolInner {
+                rx: Mutex::new(rx),
+                idle: AtomicUsize::new(0),
+                queued: AtomicUsize::new(0),
+            }),
             tx: Mutex::new(tx),
-            rx: Arc::new(Mutex::new(rx)),
-            idle: AtomicUsize::new(0),
             total: AtomicUsize::new(0),
             max,
+        }
+    }
+
+    /// Runs `job` on a worker. `handler` is only called when a new worker is started, to
+    /// make the function that worker runs jobs with. Gives the job back if no worker exists
+    /// and none can be started.
+    pub(crate) fn submit<F>(
+        &self,
+        job: J,
+        handler: impl FnOnce() -> F,
+    ) -> std::result::Result<(), J>
+    where
+        F: Fn(J) + Send + 'static,
+    {
+        let inner = &self.inner;
+        if add_bounded(&inner.idle, -1, usize::MAX) {
+            return self.send(job);
+        }
+        let job = if add_bounded(&self.total, 1, self.max) {
+            let slot = Arc::new(Mutex::new(Some(job)));
+            let (inner2, slot2, run) = (inner.clone(), slot.clone(), handler());
+            let spawned = std::thread::Builder::new()
+                .name("worker".into())
+                .stack_size(WORKER_STACK)
+                .spawn(move || {
+                    let first = slot2.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    if let Some(j) = first {
+                        run(j);
+                    }
+                    loop {
+                        // Take a queued job's claim if there is one, else announce.
+                        if !add_bounded(&inner2.queued, -1, usize::MAX) {
+                            inner2.idle.fetch_add(1, Ordering::AcqRel);
+                        }
+                        let job = inner2.rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                        let Ok(job) = job else { return };
+                        run(job);
+                    }
+                });
+            match spawned {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    eprintln!("bouncer: cannot start a worker thread: {e}");
+                    let total = self.total.fetch_sub(1, Ordering::AcqRel) - 1;
+                    let job = slot
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                        .expect("the thread never started");
+                    if total == 0 {
+                        return Err(job);
+                    }
+                    job
+                }
+            }
+        } else {
+            job
+        };
+        inner.queued.fetch_add(1, Ordering::AcqRel);
+        self.send(job)
+    }
+
+    fn send(&self, job: J) -> std::result::Result<(), J> {
+        let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner());
+        tx.send(job).map_err(|e| e.0)
+    }
+}
+
+/// Adds `delta` (+1 or -1) to `a` unless that would take it below 0 or above `max`.
+fn add_bounded(a: &AtomicUsize, delta: isize, max: usize) -> bool {
+    let mut n = a.load(Ordering::Acquire);
+    loop {
+        let Some(next) = n.checked_add_signed(delta).filter(|&x| x <= max) else {
+            return false;
+        };
+        match a.compare_exchange_weak(n, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(now) => n = now,
         }
     }
 }
@@ -637,43 +730,13 @@ impl Server {
     }
 
     fn submit(self: &Arc<Self>, job: Job) -> std::result::Result<(), Job> {
-        let p = &self.pool;
-        if p.idle.load(Ordering::Acquire) == 0 && p.total.load(Ordering::Acquire) < p.max {
+        self.pool.submit(job, || {
             let srv = self.clone();
-            let spawned = std::thread::Builder::new()
-                .name("worker".into())
-                .stack_size(WORKER_STACK)
-                .spawn(move || srv.worker());
-            match spawned {
-                Ok(_) => {
-                    p.total.fetch_add(1, Ordering::AcqRel);
-                }
-                Err(e) => {
-                    eprintln!("bouncer: cannot start a worker thread: {e}");
-                    if p.total.load(Ordering::Acquire) == 0 {
-                        return Err(job);
-                    }
-                }
+            move |job: Job| {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| srv.handle(&job)));
+                srv.inflight.fetch_sub(1, Ordering::AcqRel);
             }
-        }
-        let tx = p.tx.lock().unwrap_or_else(|e| e.into_inner());
-        tx.send(job).map_err(|e| e.0)
-    }
-
-    fn worker(self: Arc<Self>) {
-        loop {
-            self.pool.idle.fetch_add(1, Ordering::AcqRel);
-            let job = self
-                .pool
-                .rx
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .recv();
-            self.pool.idle.fetch_sub(1, Ordering::AcqRel);
-            let Ok(job) = job else { return };
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handle(&job)));
-            self.inflight.fetch_sub(1, Ordering::AcqRel);
-        }
+        })
     }
 
     fn reject(&self, uid: u32) {
@@ -1574,5 +1637,49 @@ pub(crate) mod tests {
             (last["op"].as_str(), last["result"].as_str()),
             (Some("get"), Some("denied"))
         );
+    }
+
+    /// A job submitted right after another one is never queued behind it while the pool has
+    /// room for another worker, even when an idle worker has not picked up the first yet.
+    #[test]
+    fn pool_does_not_queue_behind_a_busy_worker() {
+        enum J {
+            Block(Arc<(Mutex<bool>, std::sync::Condvar)>),
+            Quick(mpsc::Sender<()>),
+        }
+        let pool: Pool<J> = Pool::new(64);
+        let run = || {
+            |j: J| match j {
+                J::Block(g) => {
+                    let mut open = g.0.lock().unwrap();
+                    while !*open {
+                        open = g.1.wait(open).unwrap();
+                    }
+                }
+                J::Quick(tx) => tx.send(()).unwrap(),
+            }
+        };
+        for _ in 0..40 {
+            // One or more workers that finished a job and wait for the next.
+            let (tx, rx) = mpsc::channel();
+            assert!(pool.submit(J::Quick(tx), run).is_ok());
+            rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+            let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let (tx, rx) = mpsc::channel();
+            let (block, quick) = (J::Block(gate.clone()), J::Quick(tx));
+            // As many blocking jobs as there are idle workers, then a quick one at once.
+            let idle = pool.inner.idle.load(Ordering::Acquire);
+            assert!(pool.submit(block, run).is_ok());
+            for _ in 1..idle {
+                assert!(pool.submit(J::Block(gate.clone()), run).is_ok());
+            }
+            assert!(pool.submit(quick, run).is_ok());
+            let fast = rx.recv_timeout(Duration::from_secs(2));
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            assert!(fast.is_ok(), "the quick job waited behind a blocked one");
+        }
+        assert!(pool.total.load(Ordering::Acquire) <= 64);
     }
 }

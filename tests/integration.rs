@@ -739,6 +739,26 @@ fn connection_cap_and_whole_request_deadline() {
 }
 
 #[test]
+fn a_slow_client_does_not_hold_up_a_fast_one() {
+    let env = Env::start("request_timeout_ms = 3000\n");
+    env.set("A", "fake-a-value");
+    for _ in 0..5 {
+        // An idle worker exists (from the previous request). A client connects and sends
+        // nothing, which keeps a worker for up to request_timeout_ms...
+        let _slow = UnixStream::connect(env.sock()).unwrap();
+        // ...while another one asks right away.
+        let t = Instant::now();
+        let resp = env.raw(b"{\"op\":\"get\",\"names\":[\"A\"],\"reason\":\"fast client test\"}\n");
+        assert!(resp.contains("fake-a-value"), "{resp}");
+        assert!(
+            t.elapsed() < Duration::from_millis(1500),
+            "the fast client waited {:?} behind the slow one",
+            t.elapsed()
+        );
+    }
+}
+
+#[test]
 fn other_uids_are_closed_before_reading_and_aggregated() {
     let other = uid() + 1;
     let env = Env::start(&format!(
