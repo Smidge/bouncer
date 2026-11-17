@@ -1,27 +1,14 @@
-# bouncer as a system service with its own user (Linux).
+# bouncer as a system service with its own user (Linux), with privilege separation.
 #
-# The daemon runs as `bouncer`, so agents running as your login user cannot read the
-# vault or key files directly. CAP_SYS_PTRACE lets it read /proc/<pid>/environ of callers
-# owned by other users, which it needs for context attribution.
-#
-# Setup:
-#   sudo useradd --system --home-dir /var/lib/bouncer --shell /usr/sbin/nologin bouncer
-#   sudo install -m 0755 bouncer /usr/local/bin/bouncer
-#   sudo install -d -o bouncer -g bouncer -m 0700 /etc/bouncer /var/lib/bouncer
-#   sudo install -o bouncer -g bouncer -m 0600 config.toml /etc/bouncer/config.toml
-#   sudo -u bouncer env BOUNCER_CONFIG=/etc/bouncer/config.toml bouncer init
-#   sudo install -m 0644 contrib/bouncer.service /etc/systemd/system/bouncer.service
-#   sudo systemctl daemon-reload && sudo systemctl enable --now bouncer
-#
-# /etc/bouncer/config.toml for this unit (replace 1000 with your uid, from `id -u`):
-#   socket = "/run/bouncer/bouncer.sock"
-#   socket_mode = "0666"
-#   allowed_uids = [1000]
-#   key = "/etc/bouncer/key"
-#   vault = "/var/lib/bouncer/vault.bin"
-#   audit_log = "/var/lib/bouncer/audit.jsonl"
-#
-# Clients then need: export BOUNCER_SOCKET=/run/bouncer/bouncer.sock
+# The service starts as root only long enough to:
+#   - fork a small attribution helper that keeps CAP_SYS_PTRACE and CAP_DAC_READ_SEARCH (to
+#     read callers' /proc/<pid>/environ) and nothing else, running as the bouncer user;
+#   - read the vault key from an encrypted systemd credential (and any sink or admission
+#     credentials listed below);
+#   - hand /run/bouncer to the bouncer user.
+# The daemon then drops to `bouncer` with no capabilities and no way back to root.
+# `user = "bouncer"` in the config turns this on. See "Dedicated-user mode" in the README for
+# the setup steps and a matching config.
 
 [Unit]
 Description=bouncer secret store for agents
@@ -30,22 +17,50 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=bouncer
-Group=bouncer
+Type=simple
 Environment=BOUNCER_CONFIG=/etc/bouncer/config.toml
 ExecStart=/usr/local/bin/bouncer serve
-AmbientCapabilities=CAP_SYS_PTRACE
-CapabilityBoundingSet=CAP_SYS_PTRACE
-NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=2
+
+# The vault key, encrypted with the host key (and sealed to the TPM when there is one):
+#   bouncer keygen | sudo systemd-creds encrypt --name=bouncer-key - /etc/credstore.encrypted/bouncer-key
+# and key_credential = "bouncer-key" in the config.
+LoadCredentialEncrypted=bouncer-key:/etc/credstore.encrypted/bouncer-key
+# Sink or admission credentials, referenced as *_credential = "<name>" in the config:
+#LoadCredentialEncrypted=s3-secret:/etc/credstore.encrypted/s3-secret
+
 RuntimeDirectory=bouncer
-RuntimeDirectoryMode=0755
+RuntimeDirectoryMode=0710
 UMask=0077
+
+# Only what the start-up phase needs; the daemon itself ends with none of these.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_SETPCAP CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=
+NoNewPrivileges=yes
+LimitCORE=0
+LimitMEMLOCK=infinity
+
 ProtectSystem=strict
 ReadWritePaths=/var/lib/bouncer
 ProtectHome=yes
 PrivateTmp=yes
-Restart=on-failure
-RestartSec=2
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

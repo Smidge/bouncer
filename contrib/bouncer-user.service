@@ -1,7 +1,7 @@
-# bouncer as a per-user service (Linux), running as your own user.
+# bouncer as a per-user service (Linux), running as your own user ("same-user mode").
 #
-# Simple, but any process running as you can also read the vault and key files.
-# See "Threat model" in the README.
+# Simple, but any process running as you can also read the vault and key files, so this is
+# accountability, not isolation. See "Deployment modes" in the README.
 #
 #   bouncer init
 #   install -D -m 0644 contrib/bouncer-user.service ~/.config/systemd/user/bouncer.service
@@ -15,6 +15,9 @@ Documentation=https://github.com/Smidge/bouncer
 ExecStart=%h/.cargo/bin/bouncer serve
 Restart=on-failure
 RestartSec=2
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=default.target

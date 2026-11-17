@@ -27,6 +27,34 @@ jobs:
       - run: cargo test
       - run: cargo test --no-default-features
 
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.88 (rust-version in Cargo.toml)
+        run: |
+          rustup toolchain install 1.88 --profile minimal
+          rustup default 1.88
+      - run: cargo test --locked
+      - run: cargo build --locked --no-default-features
+
+  # Dedicated-user mode under systemd: the daemon starts as root, drops to `bouncer`, keeps
+  # the key in an encrypted credential, and an `agent` user is attributed across uids but
+  # cannot read the vault, key or log.
+  multiuser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - run: cargo build --release
+      - run: sudo ci/multiuser.sh target/release/bouncer systemd
+      - name: Service log
+        if: always()
+        run: sudo journalctl -u bouncer --no-pager | tail -50
+
   musl:
     runs-on: ubuntu-latest
     steps:
