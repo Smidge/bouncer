@@ -55,8 +55,8 @@ enum Outcome {
     Release(Vec<SecretValue>),
 }
 
-/// The size of a response's encoding, without making a copy of it.
-fn encoded_len(resp: &Response) -> usize {
+/// The size of a value's JSON encoding plus a newline, without making a copy of it.
+fn encoded_len(resp: &impl serde::Serialize) -> usize {
     struct Count(usize);
     impl Write for Count {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
@@ -865,29 +865,42 @@ impl Server {
         if let Some(r) = self.audit_failed() {
             return r;
         }
-        let list: Vec<ListItem> = {
+        // One page: names after `after`, at most LS_PAGE of them and, encoded, well inside
+        // MAX_RESPONSE. `next` says where the following page starts.
+        let mut resp = Response {
+            ok: true,
+            ..Default::default()
+        };
+        {
+            use std::ops::Bound;
             let v = self.vault.read().unwrap_or_else(|e| e.into_inner());
-            v.secrets
-                .iter()
-                .map(|(name, s)| ListItem {
+            let from = match &req.after {
+                Some(a) => Bound::Excluded(a.as_str()),
+                None => Bound::Unbounded,
+            };
+            let mut size = 0;
+            for (name, s) in v.secrets.range::<str, _>((from, Bound::Unbounded)) {
+                let item = ListItem {
                     name: name.clone(),
                     desc: s.desc.clone(),
                     tags: s.tags.clone(),
                     updated: s.updated.clone(),
-                })
-                .collect()
-        };
+                };
+                size += encoded_len(&item) + 1;
+                if resp.list.len() == proto::LS_PAGE || size > proto::MAX_RESPONSE - 4096 {
+                    resp.next = resp.list.last().map(|i| i.name.clone());
+                    break;
+                }
+                resp.list.push(item);
+            }
+        }
         let mut e = self.entry(req, peer, at);
         e.decision = "allow";
         e.result = "ok";
         if let Err(err) = self.append(e) {
             return Response::fail(E_AUDIT, format!("audit log write failed: {err}"));
         }
-        Response {
-            ok: true,
-            list,
-            ..Default::default()
-        }
+        resp
     }
 
     fn read(&self, req: &Request, peer: PeerCred, at: &Attribution) -> Response {
@@ -1330,6 +1343,11 @@ fn validate(req: &Request) -> Option<String> {
     if req.names.len() > MAX_NAMES {
         return Some(format!("at most {MAX_NAMES} names per request"));
     }
+    if let Some(a) = &req.after
+        && (req.op != Op::Ls || !valid_name(a))
+    {
+        return Some("`after` takes a secret name, for ls only".into());
+    }
     if let Some(n) = req.names.iter().find(|n| !valid_name(n)) {
         let shown = util::escape(&util::cap(n, 64)).into_owned();
         return Some(format!(
@@ -1682,5 +1700,82 @@ pub(crate) mod tests {
             assert!(fast.is_ok(), "the quick job waited behind a blocked one");
         }
         assert!(pool.total.load(Ordering::Acquire) <= 64);
+    }
+
+    fn insert(t: &TestServer, name: String, value: String, desc: Option<String>) {
+        let mut v = t.srv().vault.write().unwrap();
+        let rev = v.generation;
+        v.secrets.insert(
+            name,
+            Secret {
+                value,
+                desc,
+                tags: vec![],
+                created: "t".into(),
+                updated: "t".into(),
+                rev,
+            },
+        );
+    }
+
+    #[test]
+    fn ls_is_paged_within_the_response_limit() {
+        let t = TestServer::new("");
+        // 2500 descriptions of 500 control characters encode to about 3 KB each, 7.5 MB in all.
+        for i in 0..2500 {
+            insert(
+                &t,
+                format!("S{i:05}"),
+                "v".into(),
+                Some("\u{1}".repeat(500)),
+            );
+        }
+        let (mut names, mut after, mut pages) = (Vec::new(), None, 0);
+        loop {
+            let mut req = Request::new(Op::Ls, vec![], String::new());
+            req.after = after.take();
+            let r = t.call(req);
+            assert!(r.ok, "{:?}", r.error);
+            assert!(encoded_len(&r) <= proto::MAX_RESPONSE);
+            assert!(r.list.len() <= proto::LS_PAGE);
+            names.extend(r.list.iter().map(|i| i.name.clone()));
+            pages += 1;
+            match r.next {
+                Some(n) => after = Some(n),
+                None => break,
+            }
+        }
+        assert!(pages >= 2, "{pages}");
+        assert_eq!(names.len(), 2500);
+        assert!(
+            names.windows(2).all(|w| w[0] < w[1]),
+            "in order, no repeats"
+        );
+        let mut bad = Request::new(Op::Get, vec!["A".into()], "a reason here".into());
+        bad.after = Some("x".into());
+        assert_eq!(t.call(bad).code.as_deref(), Some(E_BAD_REQUEST));
+    }
+
+    #[test]
+    fn get_limit_counts_the_encoded_response() {
+        let t = TestServer::new("");
+        // 3 x 256 KiB of control characters: 768 KiB of values, but over 4 MiB as JSON.
+        for n in ["A", "B", "C"] {
+            insert(&t, n.into(), "\u{1}".repeat(proto::MAX_VALUE), None);
+        }
+        let names = vec!["A".to_string(), "B".into(), "C".into()];
+        let r = t.call(Request::new(Op::Exec, names, "a reason here".into()));
+        assert!(!r.ok && r.values.is_empty());
+        assert!(r.error.unwrap().contains("too large"));
+        let last = t.ops().pop().unwrap();
+        assert_eq!(last["result"], "error", "not recorded as released");
+        // One of them fits.
+        let r = t.call(Request::new(
+            Op::Get,
+            vec!["A".into()],
+            "a reason here".into(),
+        ));
+        assert!(r.ok);
+        assert_eq!(t.ops().pop().unwrap()["result"], "ok");
     }
 }

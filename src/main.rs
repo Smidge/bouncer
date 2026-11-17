@@ -690,18 +690,33 @@ fn cmd_ls(cfg: &Config, mut args: Args) -> Result<i32> {
         Ok(f) => !f.is_empty(),
         Err(a) => return usage_err(format!("unexpected argument `{}`", escape(&a))),
     };
-    let resp = match call(cfg, &Request::new(Op::Ls, vec![], String::new())) {
-        Ok(r) => r,
-        Err(code) => return Ok(code),
-    };
+    // The daemon answers in pages; `next` is the last name of a page that has a successor.
+    let mut list = Vec::new();
+    let mut after = None;
+    loop {
+        let mut req = Request::new(Op::Ls, vec![], String::new());
+        req.after = after.take();
+        let resp = match call(cfg, &req) {
+            Ok(r) => r,
+            Err(code) => return Ok(code),
+        };
+        list.extend(resp.list);
+        match resp.next {
+            Some(n) if list.last().is_some_and(|l: &proto::ListItem| l.name == n) => {
+                after = Some(n)
+            }
+            Some(_) => return Err(err!("the daemon sent a malformed page of names")),
+            None => break,
+        }
+    }
     let mut out = io::stdout().lock();
     if json {
-        serde_json::to_writer(&mut out, &resp.list).map_err(|e| err!("{e}"))?;
+        serde_json::to_writer(&mut out, &list).map_err(|e| err!("{e}"))?;
         writeln!(out)?;
         return Ok(0);
     }
-    let width = resp.list.iter().map(|i| i.name.len()).max().unwrap_or(0);
-    for i in &resp.list {
+    let width = list.iter().map(|i| i.name.len()).max().unwrap_or(0);
+    for i in &list {
         let tags = if i.tags.is_empty() {
             String::new()
         } else {

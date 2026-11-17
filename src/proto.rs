@@ -28,6 +28,8 @@ pub const MAX_REASON: usize = 1000;
 pub const MAX_DESC: usize = 500;
 /// Tags per secret.
 pub const MAX_TAGS: usize = 16;
+/// Most names in one `ls` answer; the rest come in further pages.
+pub const LS_PAGE: usize = 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -80,6 +82,9 @@ pub struct Request {
     /// `verify`: an anchored head, `SEQ:HASH`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect_head: Option<String>,
+    /// `ls`: list names after this one (the previous page's `next`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
 }
 
 /// A secret value in transit: wiped on drop, never printed by `Debug`.
@@ -109,6 +114,7 @@ impl Request {
             desc: None,
             tags: Vec::new(),
             expect_head: None,
+            after: None,
         }
     }
 }
@@ -143,6 +149,9 @@ pub struct Response {
     pub values: Vec<SecretValue>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub list: Vec<ListItem>,
+    /// `ls`: there are more names; ask again with `after` set to this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
     /// The admission model's reasoning, when it was consulted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
