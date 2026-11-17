@@ -33,7 +33,7 @@ use crate::proto::{
     MAX_DESC, MAX_NAMES, MAX_REASON, MAX_TAGS, Op, Request, Response, SecretValue,
 };
 use crate::sink::{self, StatusHandle};
-use crate::util::{self, Dir, Result, ctx};
+use crate::util::{self, Dir, Result, WriteError, ctx};
 use crate::vault::{self, Key, Secret, Vault, valid_name};
 
 const WORKER_STACK: usize = 512 * 1024;
@@ -86,6 +86,9 @@ pub struct Server {
     started: String,
     inflight: AtomicUsize,
     pool: Pool,
+    /// Test hook: the directory fsync after the vault rename fails.
+    #[cfg(test)]
+    fail_dir_sync: std::sync::atomic::AtomicBool,
     _lock: File,
 }
 
@@ -275,91 +278,18 @@ pub fn serve(mut cfg: Config, opts: Options) -> Result<()> {
         eprintln!("bouncer: warning: {w}");
     }
 
-    let lock = lock_store(&cfg)?;
-    let key = match preloaded_key {
-        Some(k) => k,
-        None => vault::load_key(&cfg.key)?,
-    };
-    let (vdir, vname) = util::split_path(&cfg.vault)?;
-    let vault_dir = Dir::secure(&vdir, true)?;
-    let vault_name = vname.to_os_string();
-    let (vault, file_hash) = Vault::load(&vault_dir, &vault_name, &key)?;
-    let (mut log, verified) = AuditLog::open(
-        &cfg.audit_log,
-        vault::chain_key(&key),
-        cfg.audit_fsync == FsyncMode::Strict,
-    )?;
-    let host = util::hostname();
-    let found = VaultState {
-        generation: vault.generation,
-        hash: file_hash,
-    };
-    check_vault_state(
-        &mut log,
-        &verified,
-        &found,
-        &host,
-        opts.accept_vault_mismatch,
-    )?;
-    let mut start = Entry::new("start", &host);
-    start.vault_gen = Some(found.generation);
-    start.note = Some(format!(
-        "bouncer {} pid {} uid {}",
-        env!("CARGO_PKG_VERSION"),
-        std::process::id(),
-        util::geteuid()
-    ));
-    log.append(start)?;
-
     let group = cfg
         .socket_group
         .as_deref()
         .map(crate::config::lookup_group)
         .transpose()?;
-    let listener = bind(&cfg.socket, cfg.socket_mode, group)?;
-    let admin_listener = match &cfg.admin_socket {
+    let (socket, admin_socket) = (cfg.socket.clone(), cfg.admin_socket.clone());
+    let server = Server::open(cfg, opts, attr, preloaded_key)?;
+    let listener = bind(&socket, server.cfg.socket_mode, group)?;
+    let admin_listener = match &admin_socket {
         Some(p) => Some(bind(p, 0o600, None)?),
         None => None,
     };
-
-    let shared = log.shared.clone();
-    let mut sinks = Vec::new();
-    for s in &cfg.sinks {
-        let (sc, h, vars) = (s.clone(), host.clone(), cfg.context_vars.clone());
-        let factory = Box::new(move || sink::build(&sc, &h, &vars));
-        factory().map_err(|e| err!("sink {}: {e}", s.name))?; // fail fast on bad config
-        sinks.push(sink::spawn(
-            s.name.clone(),
-            s.kind.type_name(),
-            factory,
-            cfg.audit_log.clone(),
-            cfg.sink_cursor(&s.name),
-            shared.clone(),
-        )?);
-    }
-    let admission = build_admission(&cfg)?;
-    let count = vault.secrets.len();
-    let server = Arc::new(Server {
-        base: policy::default_policy(cfg.min_reason_len),
-        admission,
-        attr,
-        host,
-        key,
-        vault: RwLock::new(vault),
-        vault_dir,
-        vault_name,
-        audit: Mutex::new(log),
-        shared,
-        write_lock: Mutex::new(()),
-        rejects: Mutex::new(Rejects::default()),
-        rejected_total: AtomicU64::new(0),
-        sinks,
-        started: util::rfc3339_ms(util::now_ms()),
-        inflight: AtomicUsize::new(0),
-        pool: Pool::new(cfg.max_connections),
-        _lock: lock,
-        cfg,
-    });
     {
         let srv = server.clone();
         std::thread::Builder::new()
@@ -382,11 +312,104 @@ pub fn serve(mut cfg: Config, opts: Options) -> Result<()> {
             .map_err(|e| err!("cannot start admin socket thread: {e}"))?;
     }
     eprintln!(
-        "bouncer: serving {count} secret(s) on {}",
-        server.cfg.socket.display()
+        "bouncer: serving {} secret(s) on {}",
+        server
+            .vault
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .secrets
+            .len(),
+        socket.display()
     );
     accept_loop(&server, &listener, false);
     Ok(())
+}
+
+impl Server {
+    /// Opens the store (lock, key, vault, verified audit log), reconciles the vault with the
+    /// log, records `start`, and starts the sinks. Does not bind sockets.
+    fn open(
+        cfg: Config,
+        opts: Options,
+        attr: AttrSource,
+        preloaded_key: Option<Key>,
+    ) -> Result<Arc<Server>> {
+        let lock = lock_store(&cfg)?;
+        let key = match preloaded_key {
+            Some(k) => k,
+            None => vault::load_key(&cfg.key)?,
+        };
+        let (vdir, vname) = util::split_path(&cfg.vault)?;
+        let vault_dir = Dir::secure(&vdir, true)?;
+        let vault_name = vname.to_os_string();
+        let (vault, file_hash) = Vault::load(&vault_dir, &vault_name, &key)?;
+        let (mut log, verified) = AuditLog::open(
+            &cfg.audit_log,
+            vault::chain_key(&key),
+            cfg.audit_fsync == FsyncMode::Strict,
+        )?;
+        let host = util::hostname();
+        let found = VaultState {
+            generation: vault.generation,
+            hash: file_hash,
+        };
+        check_vault_state(
+            &mut log,
+            &verified,
+            &found,
+            &host,
+            opts.accept_vault_mismatch,
+        )?;
+        let mut start = Entry::new("start", &host);
+        start.vault_gen = Some(found.generation);
+        start.note = Some(format!(
+            "bouncer {} pid {} uid {}",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
+            util::geteuid()
+        ));
+        log.append(start)?;
+
+        let shared = log.shared.clone();
+        let mut sinks = Vec::new();
+        for s in &cfg.sinks {
+            let (sc, h, vars) = (s.clone(), host.clone(), cfg.context_vars.clone());
+            let factory = Box::new(move || sink::build(&sc, &h, &vars));
+            factory().map_err(|e| err!("sink {}: {e}", s.name))?; // fail fast on bad config
+            sinks.push(sink::spawn(
+                s.name.clone(),
+                s.kind.type_name(),
+                factory,
+                cfg.audit_log.clone(),
+                cfg.sink_cursor(&s.name),
+                shared.clone(),
+            )?);
+        }
+        let admission = build_admission(&cfg)?;
+        Ok(Arc::new(Server {
+            base: policy::default_policy(cfg.min_reason_len),
+            admission,
+            attr,
+            host,
+            key,
+            vault: RwLock::new(vault),
+            vault_dir,
+            vault_name,
+            audit: Mutex::new(log),
+            shared,
+            write_lock: Mutex::new(()),
+            rejects: Mutex::new(Rejects::default()),
+            rejected_total: AtomicU64::new(0),
+            sinks,
+            started: util::rfc3339_ms(util::now_ms()),
+            inflight: AtomicUsize::new(0),
+            pool: Pool::new(cfg.max_connections),
+            #[cfg(test)]
+            fail_dir_sync: std::sync::atomic::AtomicBool::new(false),
+            _lock: lock,
+            cfg,
+        }))
+    }
 }
 
 #[cfg(feature = "net")]
@@ -416,6 +439,31 @@ fn check_vault_state(
     accept: bool,
 ) -> Result<()> {
     let st = &v.state;
+    // A change whose save was interrupted after the rename: the file on disk decides.
+    if let Some(u) = &st.uncertain {
+        let kept = &u.after == found;
+        if kept || u.before.as_ref() == Some(found) {
+            let mut e = Entry::new(if kept { "reconcile" } else { "abort" }, host);
+            e.txn = Some(u.txn.clone());
+            e.note = Some(if kept {
+                "start-up: the vault file has this change, so it was committed".into()
+            } else {
+                "start-up: the vault file is from before this change, so it was not committed"
+                    .into()
+            });
+            eprintln!(
+                "bouncer: change {} (saved without a confirmed directory fsync) was {}",
+                u.txn,
+                if kept {
+                    "kept"
+                } else {
+                    "lost; recorded as aborted"
+                }
+            );
+            log.append(e)?;
+            return Ok(());
+        }
+    }
     if st.current.as_ref() == Some(found) {
         return Ok(());
     }
@@ -1000,22 +1048,50 @@ impl Server {
             );
         }
         // 2. Persist.
-        if let Err(err) = self.vault_dir.write_atomic(&self.vault_name, &bytes, 0o600) {
-            let mut abort = Entry::new("abort", &self.host);
-            abort.txn = Some(txn);
-            abort.why = Some(err.0.clone());
-            let logged = self.append(abort);
-            return Response::fail(
-                E_INTERNAL,
-                format!(
-                    "could not save the vault ({err}); the change was rolled back{}",
-                    if logged.is_err() {
-                        " (and the audit log failed too)"
-                    } else {
-                        ""
-                    }
-                ),
-            );
+        match self.save_vault(&bytes) {
+            Ok(()) => {}
+            Err(WriteError::NotReplaced(err)) => {
+                let mut abort = Entry::new("abort", &self.host);
+                abort.txn = Some(txn);
+                abort.why = Some(err.0.clone());
+                let logged = self.append(abort);
+                return Response::fail(
+                    E_INTERNAL,
+                    format!(
+                        "could not save the vault ({err}); the change was rolled back{}",
+                        if logged.is_err() {
+                            " (and the audit log failed too)"
+                        } else {
+                            ""
+                        }
+                    ),
+                );
+            }
+            Err(WriteError::Uncertain(err)) => {
+                // The new vault is on disk but may not survive a crash, so this is neither a
+                // commit nor an abort. Record that, and stop serving until a restart lets the
+                // file on disk decide (see check_vault_state).
+                let mut e = Entry::new("commit_uncertain", &self.host);
+                e.txn = Some(txn.clone());
+                e.why = Some(err.0.clone());
+                let logged = self.append(e);
+                let _ = self.shared.latch(format!(
+                    "the vault save for change {txn} may not be durable ({err})"
+                ));
+                return Response::fail(
+                    E_INTERNAL,
+                    format!(
+                        "the vault file was replaced, but the change may not survive a crash ({err}){}. \
+                         The daemon now refuses requests: fix the cause, run `bouncer repair` and restart; \
+                         start-up then checks the vault file and records whether the change was kept",
+                        if logged.is_err() {
+                            " (and the audit log failed too)"
+                        } else {
+                            ""
+                        }
+                    ),
+                );
+            }
         }
         // 3. Publish.
         *self.vault.write().unwrap_or_else(|e| e.into_inner()) = next;
@@ -1023,6 +1099,16 @@ impl Server {
             ok: true,
             ..Default::default()
         }
+    }
+
+    fn save_vault(&self, bytes: &[u8]) -> std::result::Result<(), WriteError> {
+        #[cfg(test)]
+        if self.fail_dir_sync.load(Ordering::Acquire) {
+            return self
+                .vault_dir
+                .replace_failing_dir_sync(&self.vault_name, bytes, 0o600);
+        }
+        self.vault_dir.replace(&self.vault_name, bytes, 0o600)
     }
 
     fn status(&self) -> Response {
@@ -1155,4 +1241,197 @@ fn validate(req: &Request) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A daemon on a fresh store in a temp directory, without sockets or sinks.
+    pub(crate) struct TestServer {
+        srv: Option<Arc<Server>>,
+        pub dir: std::path::PathBuf,
+        pub cfg: Config,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    static N: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) fn config(dir: &Path, extra: &str) -> Config {
+        let mut cfg = Config::load(Some(dir.join("absent.toml")), None).unwrap();
+        cfg.apply(crate::config::parse_toml(extra).unwrap())
+            .unwrap();
+        cfg.vault = dir.join("vault.bin");
+        cfg.audit_log = dir.join("audit.jsonl");
+        cfg.key = crate::config::KeySource::File(dir.join("key"));
+        cfg.socket = dir.join("bouncer.sock");
+        cfg.mlock = false;
+        cfg
+    }
+
+    /// Creates the key, an empty vault and the log, like `bouncer init`.
+    pub(crate) fn init_store(cfg: &Config) {
+        let crate::config::KeySource::File(k) = &cfg.key else {
+            unreachable!()
+        };
+        vault::generate_key_file(k).unwrap();
+        let key = vault::load_key(&cfg.key).unwrap();
+        let v = Vault {
+            generation: 1,
+            ..Default::default()
+        };
+        let bytes = v.encrypt(&key).unwrap();
+        let (mut log, _) = AuditLog::open(&cfg.audit_log, vault::chain_key(&key), true).unwrap();
+        let mut e = Entry::new("init", "h");
+        e.vault_gen = Some(1);
+        e.vault_hash = Some(util::sha256_hex(&bytes));
+        log.append(e).unwrap();
+        util::write_file_atomic(&cfg.vault, &bytes, 0o600).unwrap();
+    }
+
+    pub(crate) fn start(cfg: Config) -> Result<Arc<Server>> {
+        let attr = AttrSource::Local(Attributor::new(
+            cfg.context_vars.clone(),
+            cfg.max_chain_depth,
+        ));
+        Server::open(cfg, Options::default(), attr, None)
+    }
+
+    impl TestServer {
+        pub(crate) fn new(extra: &str) -> TestServer {
+            let dir = std::env::temp_dir().join(format!(
+                "bouncer-srv-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::SeqCst)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let cfg = config(&dir, extra);
+            init_store(&cfg);
+            TestServer {
+                srv: Some(start(cfg.clone()).unwrap()),
+                dir,
+                cfg,
+            }
+        }
+
+        pub(crate) fn srv(&self) -> &Arc<Server> {
+            self.srv.as_ref().expect("the server is running")
+        }
+
+        /// Stops the daemon (releasing the store lock) and starts it again.
+        pub(crate) fn restart(&mut self) -> Result<()> {
+            self.srv = None;
+            self.srv = Some(start(self.cfg.clone())?);
+            Ok(())
+        }
+
+        pub(crate) fn call(&self, req: Request) -> Response {
+            let (a, _b) = UnixStream::pair().unwrap();
+            let job = Job {
+                caller: Caller::identify(&a).unwrap(),
+                stream: a,
+                admin_socket: false,
+            };
+            let at = Attribution {
+                status: "ok".into(),
+                ..Default::default()
+            };
+            self.srv().process(req, &job, &at)
+        }
+
+        pub(crate) fn set(&self, name: &str, value: &str) -> Response {
+            let mut req = Request::new(Op::Set, vec![name.into()], String::new());
+            req.value = Some(SecretValue(value.into()));
+            self.call(req)
+        }
+
+        pub(crate) fn get(&self, name: &str) -> Response {
+            self.call(Request::new(
+                Op::Get,
+                vec![name.into()],
+                "unit test of the server".into(),
+            ))
+        }
+
+        pub(crate) fn ops(&self) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(&self.cfg.audit_log)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn save_failure_before_rename_is_a_rollback() {
+        let t = TestServer::new("");
+        assert!(t.set("A", "old-value").ok);
+        std::fs::set_permissions(&t.dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let r = t.set("A", "new-value");
+        std::fs::set_permissions(&t.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Root ignores the directory mode; nothing to check then.
+        if util::geteuid() == 0 {
+            return;
+        }
+        assert!(r.error.unwrap().contains("rolled back"));
+        assert_eq!(t.get("A").values[0].0, "old-value");
+        let ops = t.ops();
+        assert_eq!(ops[ops.len() - 2]["op"], "abort");
+        assert!(
+            t.srv().shared.failed().is_none(),
+            "a clean rollback does not latch"
+        );
+    }
+
+    #[test]
+    fn save_failure_after_rename_is_uncertain_and_reconciled() {
+        for kept in [true, false] {
+            let mut t = TestServer::new("");
+            assert!(t.set("A", "old-value").ok);
+            let old_vault = std::fs::read(&t.cfg.vault).unwrap();
+            t.srv().fail_dir_sync.store(true, Ordering::Release);
+            let r = t.set("A", "new-value");
+            let msg = r.error.unwrap();
+            assert!(msg.contains("may not survive a crash"), "{msg}");
+            assert!(!msg.contains("rolled back"), "{msg}");
+            // Not reported as an abort, and the daemon is latched, on disk too.
+            let ops = t.ops();
+            let last = ops.last().unwrap();
+            assert_eq!(last["op"], "commit_uncertain");
+            assert_eq!(last["txn"], ops[ops.len() - 2]["txn"]);
+            assert!(!ops.iter().any(|e| e["op"] == "abort"));
+            assert_eq!(t.get("A").code.as_deref(), Some(E_AUDIT));
+            // The new vault is on disk; a crash may or may not have kept it.
+            if !kept {
+                std::fs::write(&t.cfg.vault, &old_vault).unwrap();
+            }
+            let e = t.restart().err().unwrap().to_string();
+            assert!(e.contains("bouncer repair"), "{e}");
+            audit::repair(
+                &t.cfg.audit_log,
+                Some(&vault::chain_key(&vault::load_key(&t.cfg.key).unwrap())),
+            )
+            .unwrap();
+            // Start-up lets the vault file decide, without --accept-vault-mismatch.
+            t.restart().unwrap();
+            let want = if kept { "new-value" } else { "old-value" };
+            assert_eq!(t.get("A").values[0].0, want);
+            let ops = t.ops();
+            let txn = &ops.iter().find(|e| e["op"] == "commit_uncertain").unwrap()["txn"];
+            let settle = &ops[ops.len() - 3];
+            assert_eq!(settle["op"], if kept { "reconcile" } else { "abort" });
+            assert_eq!(&settle["txn"], txn);
+            // And it stays settled across another restart.
+            t.restart().unwrap();
+            assert_eq!(t.get("A").values[0].0, want);
+        }
+    }
 }

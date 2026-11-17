@@ -476,10 +476,47 @@ impl Dir {
     /// Writes `data` to `name` atomically: a randomly named temp file created with
     /// `O_CREAT | O_EXCL | O_NOFOLLOW` at `mode`, fsync, rename, fsync the directory.
     pub fn write_atomic(&self, name: &OsStr, data: &[u8], mode: u32) -> Result<()> {
+        self.replace(name, data, mode).map_err(|e| match e {
+            WriteError::NotReplaced(e) | WriteError::Uncertain(e) => e,
+        })
+    }
+
+    /// `write_atomic`, telling a failure before the rename (nothing changed) from one after it
+    /// (the new file is in place, but the rename may not survive a crash).
+    pub fn replace(
+        &self,
+        name: &OsStr,
+        data: &[u8],
+        mode: u32,
+    ) -> std::result::Result<(), WriteError> {
+        self.replace_inner(name, data, mode, false)
+    }
+
+    /// `replace` with the directory fsync after the rename made to fail.
+    #[cfg(test)]
+    pub(crate) fn replace_failing_dir_sync(
+        &self,
+        name: &OsStr,
+        data: &[u8],
+        mode: u32,
+    ) -> std::result::Result<(), WriteError> {
+        self.replace_inner(name, data, mode, true)
+    }
+
+    fn replace_inner(
+        &self,
+        name: &OsStr,
+        data: &[u8],
+        mode: u32,
+        fail_dir_sync: bool,
+    ) -> std::result::Result<(), WriteError> {
+        let target = self.path.join(name);
         let mut tmp = std::ffi::OsString::from(".");
         tmp.push(name);
-        tmp.push(format!(".{}.tmp", random_hex::<8>()?));
-        let target = self.path.join(name);
+        tmp.push(format!(
+            ".{}.tmp",
+            random_hex::<8>().map_err(WriteError::NotReplaced)?
+        ));
         let write = || -> io::Result<()> {
             let mut f = self.create_excl(&tmp, mode)?;
             f.write_all(data)?;
@@ -487,14 +524,37 @@ impl Dir {
             let (a, b) = (cstr(&tmp)?, cstr(name)?);
             // SAFETY: both names are NUL-terminated; the dir fd is open.
             cvt(unsafe { libc::renameat(self.fd(), a.as_ptr(), self.fd(), b.as_ptr()) })?;
+            Ok(())
+        };
+        if let Err(e) = write() {
+            let _ = self.unlink(&tmp);
+            return Err(WriteError::NotReplaced(Error(format!(
+                "cannot write {}: {e}",
+                target.display()
+            ))));
+        }
+        let synced = if fail_dir_sync {
+            Err(io::Error::other("injected directory fsync failure"))
+        } else {
             self.sync()
         };
-        let r = write();
-        if r.is_err() {
-            let _ = self.unlink(&tmp);
-        }
-        ctx(r, "cannot write", &target)
+        synced.map_err(|e| {
+            WriteError::Uncertain(Error(format!(
+                "replaced {} but could not fsync its directory: {e}",
+                target.display()
+            )))
+        })
     }
+}
+
+/// How an atomic replace failed.
+#[derive(Debug)]
+pub enum WriteError {
+    /// Before the rename: the old file is untouched.
+    NotReplaced(Error),
+    /// After the rename: the new file is in place but may not be durable, so after a crash
+    /// either version may be found.
+    Uncertain(Error),
 }
 
 /// Checks a directory's metadata (see `Dir::secure`).

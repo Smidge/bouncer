@@ -332,24 +332,52 @@ pub struct VaultState {
     pub hash: String,
 }
 
-/// Follows vault state through the log: mutations set it, `abort` entries undo the last one.
+/// A mutation whose vault file was replaced but not known to be durable (`commit_uncertain`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Uncertain {
+    pub txn: String,
+    pub before: Option<VaultState>,
+    pub after: VaultState,
+}
+
+/// Follows vault state through the log: mutations set it, `abort` entries undo the last one,
+/// `commit_uncertain` marks it as undecided until a `reconcile` or `abort` settles it.
 #[derive(Clone, Debug, Default)]
 pub struct StateTracker {
     pub current: Option<VaultState>,
     /// The last mutation: (txn, state before it, its seq).
     pub last_txn: Option<(String, Option<VaultState>, u64)>,
+    pub uncertain: Option<Uncertain>,
 }
 
 impl StateTracker {
     fn observe(&mut self, m: &Meta) {
-        if m.op == "abort" {
-            if let (Some(t), Some((txn, before, _))) = (&m.txn, &self.last_txn)
-                && t == txn
-            {
-                self.current = before.clone();
-                self.last_txn = None;
+        let same_txn = |t: &Option<(String, Option<VaultState>, u64)>| matches!((&m.txn, t), (Some(a), Some((b, _, _))) if a == b);
+        match m.op.as_str() {
+            "abort" => {
+                if same_txn(&self.last_txn) {
+                    let (_, before, _) = self.last_txn.take().expect("matched above");
+                    self.current = before;
+                    self.uncertain = None;
+                }
+                return;
             }
-            return;
+            "commit_uncertain" => {
+                if same_txn(&self.last_txn)
+                    && let Some(after) = self.current.clone()
+                {
+                    let (txn, before, _) = self.last_txn.clone().expect("matched above");
+                    self.uncertain = Some(Uncertain { txn, before, after });
+                }
+                return;
+            }
+            "reconcile" => {
+                if self.uncertain.as_ref().map(|u| &u.txn) == m.txn.as_ref() {
+                    self.uncertain = None;
+                }
+                return;
+            }
+            _ => {}
         }
         if let (Some(generation), Some(hash)) = (m.vault_gen, &m.vault_hash) {
             let before = self.current.replace(VaultState {
@@ -357,6 +385,7 @@ impl StateTracker {
                 hash: hash.clone(),
             });
             self.last_txn = m.txn.clone().map(|t| (t, before, m.seq));
+            self.uncertain = None;
         }
     }
 }
