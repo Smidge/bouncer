@@ -1,171 +1,284 @@
 //! Caller attribution from the OS: peer credentials of the socket and the process ancestry.
 //!
-//! Nothing here trusts what the client says about itself. The peer pid/uid come from the
-//! kernel (`SO_PEERCRED` on Linux, `getpeereid` + `LOCAL_PEERPID` on macOS), and context
-//! variables such as `CLAUDE_CODE_SESSION_ID` are taken from the *oldest* ancestor that has
-//! them, so a child process cannot spoof them by setting the variable itself.
+//! The peer pid/uid come from the kernel (`SO_PEERCRED` on Linux, `getpeereid` and
+//! `LOCAL_PEERPID` on macOS). Context variables such as `CLAUDE_CODE_SESSION_ID` are read
+//! from the initial environment of every ancestor up to pid 1; the value from the *oldest*
+//! ancestor is the primary one, and every other distinct value is recorded with its pid.
+//!
+//! These variables are advisory. Any process can start a child with whatever environment it
+//! likes, and a process that is reparented to init (double fork, detached daemon) has no
+//! agent ancestor at all. See "Caller attribution" in the README.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
-use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Serialize)]
+use crate::util::cap;
+
+/// Ancestors walked before giving up (recorded as `chain_truncated`).
+pub const HARD_DEPTH: usize = 512;
+/// Characters kept from a context variable value.
+pub const MAX_CTX_VALUE: usize = 256;
+/// Distinct values recorded per context variable.
+pub const MAX_CTX_VALUES: usize = 8;
+const MAX_EXE: usize = 256;
+const MAX_CWD: usize = 512;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct PeerCred {
     pub uid: u32,
     pub gid: u32,
     pub pid: i32,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChainEntry {
     pub pid: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exe: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argv: Option<String>,
     /// False when the process environment could not be read.
-    #[serde(skip_serializing_if = "is_true")]
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub env: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn is_true(b: &bool) -> bool {
     *b
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct CtxValue {
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CtxOther {
     pub value: String,
     pub pid: i32,
 }
 
-#[derive(Clone, Debug, Default)]
+/// A context variable: the oldest ancestor's value, plus other values seen below it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CtxValue {
+    pub value: String,
+    pub pid: i32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other: Vec<CtxOther>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Attribution {
     /// "ok", "partial" (some same-uid ancestor's environment was unreadable) or "unavailable".
-    pub status: &'static str,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub context: BTreeMap<String, CtxValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chain: Vec<ChainEntry>,
+    /// Processes walked, which can exceed the recorded `chain` (`max_chain_depth`).
+    #[serde(default)]
+    pub ancestors: usize,
+    /// The walk stopped at `HARD_DEPTH` before reaching pid 1.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub chain_truncated: bool,
+}
+
+impl Attribution {
+    pub fn unavailable(why: impl Into<String>) -> Attribution {
+        Attribution {
+            status: "unavailable".into(),
+            error: Some(why.into()),
+            ..Default::default()
+        }
+    }
+
+    pub fn is_unavailable(&self) -> bool {
+        self.status == "unavailable"
+    }
+
+    /// The primary value of the first configured variable present, used as a thread id.
+    pub fn thread(&self, vars: &[String]) -> Option<&str> {
+        vars.iter()
+            .find_map(|v| self.context.get(v))
+            .map(|c| c.value.as_str())
+    }
+
+    /// Cuts the record down to fit size limits (see `audit::MAX_ENTRY`).
+    pub fn shrink(&mut self) {
+        self.chain.truncate(4);
+        for c in &mut self.chain {
+            c.argv = None;
+        }
+        for c in self.context.values_mut() {
+            c.other.clear();
+        }
+    }
 }
 
 pub fn peer_cred(stream: &UnixStream) -> io::Result<PeerCred> {
     sys::peer_cred(stream.as_raw_fd())
 }
 
-/// Cheap per-process facts used to walk the tree and key the cache.
-struct Basic {
+/// The connecting process, identified right after accept.
+pub struct Caller {
+    pub cred: PeerCred,
+    pidfd: Option<OwnedFd>,
+    start: Option<u64>,
+}
+
+impl Caller {
+    pub fn identify(stream: &UnixStream) -> io::Result<Caller> {
+        let cred = peer_cred(stream)?;
+        let pidfd = sys::peer_pidfd(stream.as_raw_fd());
+        let start = (cred.pid > 0)
+            .then(|| sys::basic(cred.pid).map(|b| b.start))
+            .flatten();
+        Ok(Caller { cred, pidfd, start })
+    }
+
+    /// True if the peer pid still names the same, live process: its pidfd (Linux 6.5+) is
+    /// alive and its start time is unchanged. A pid cannot be reused while the process lives.
+    pub fn still_same(&self) -> bool {
+        if let Some(fd) = &self.pidfd
+            && !sys::pidfd_alive(fd)
+        {
+            return false;
+        }
+        self.start.is_some() && sys::basic(self.cred.pid).map(|b| b.start) == self.start
+    }
+}
+
+/// Cheap per-process facts used to walk the tree.
+pub(crate) struct Basic {
     ppid: i32,
     uid: Option<u32>,
     start: u64,
 }
 
-/// Facts that never change for a given (pid, start time), so they are cached.
-struct Details {
-    exe: Option<String>,
-    argv: Option<String>,
-    /// Configured context variables found in the initial environment; None if unreadable.
-    ctx: Option<Vec<(String, String)>>,
-}
-
 pub struct Attributor {
     vars: Vec<String>,
     depth: usize,
-    cache: Mutex<HashMap<(i32, u64), Arc<Details>>>,
 }
-
-const CACHE_MAX: usize = 4096;
 
 impl Attributor {
     pub fn new(vars: Vec<String>, depth: usize) -> Attributor {
-        Attributor {
-            vars,
-            depth,
-            cache: Mutex::new(HashMap::new()),
-        }
+        Attributor { vars, depth }
     }
 
-    fn details(&self, pid: i32, start: u64) -> Arc<Details> {
-        if let Some(d) = self.cache.lock().unwrap().get(&(pid, start)) {
-            return d.clone();
+    /// Walks from `pid` up to pid 1 and gathers attribution. Nothing is cached: a process
+    /// can exec (same pid and start time, new image) or rewrite its environment block.
+    pub fn attribute(&self, pid: i32) -> Attribution {
+        if pid <= 0 {
+            return Attribution::unavailable(
+                "the kernel did not report the caller's pid (another pid namespace?)",
+            );
         }
-        let (args, env) = sys::args_env(pid);
-        // An empty environment means it was hidden from us (macOS does this for Apple
-        // platform binaries such as /bin/sh and /bin/zsh), so treat it as unreadable.
-        let ctx = env.filter(|e| !e.is_empty()).map(|env| {
-            let mut found = Vec::new();
-            for entry in &env {
-                let Some(eq) = entry.iter().position(|&b| b == b'=') else {
+        let mut chain = Vec::new();
+        // (var index, value, pid), newest first.
+        let mut found: Vec<(usize, String, i32)> = Vec::new();
+        let mut unreadable_same_uid = false;
+        let mut first_env_ok = None;
+        let mut first_uid = None;
+        let mut truncated = false;
+        let mut walked = 0;
+        let mut cur = pid;
+        loop {
+            if walked == HARD_DEPTH {
+                truncated = true;
+                break;
+            }
+            let Some(b) = sys::basic(cur) else { break };
+            walked += 1;
+            let (args, env) = sys::args_env(cur);
+            // An empty environment means it was hidden from us (macOS does this for Apple
+            // platform binaries such as /bin/sh and /bin/zsh), so treat it as unreadable.
+            let env_ok = env.as_ref().is_some_and(|e| !e.is_empty());
+            if walked == 1 {
+                first_env_ok = Some(env_ok);
+                first_uid = b.uid;
+            } else if !env_ok && b.uid.is_some() && b.uid == first_uid {
+                unreadable_same_uid = true;
+            }
+            for entry in env.iter().flatten() {
+                let Some(eq) = entry.iter().position(|&c| c == b'=') else {
                     continue;
                 };
-                let (k, v) = (&entry[..eq], &entry[eq + 1..]);
-                if let Some(var) = self.vars.iter().find(|var| var.as_bytes() == k) {
-                    found.push((var.clone(), String::from_utf8_lossy(v).into_owned()));
+                if let Some(i) = self.vars.iter().position(|v| v.as_bytes() == &entry[..eq]) {
+                    let v = String::from_utf8_lossy(&entry[eq + 1..]);
+                    found.push((i, cap(&v, MAX_CTX_VALUE), cur));
                 }
             }
-            found
-        });
-        let exe = sys::exe(pid).or_else(|| args.as_ref().and_then(|a| a.first().cloned()));
-        let d = Arc::new(Details {
-            exe,
-            argv: args.as_deref().map(short_argv),
-            ctx,
-        });
-        let mut cache = self.cache.lock().unwrap();
-        if cache.len() >= CACHE_MAX {
-            cache.clear();
-        }
-        cache.insert((pid, start), d.clone());
-        d
-    }
-
-    /// Walks from `pid` up through its ancestors and gathers attribution.
-    pub fn attribute(&self, pid: i32) -> Attribution {
-        let mut chain = Vec::new();
-        let mut ctxs = Vec::new();
-        let mut cur = pid;
-        while chain.len() < self.depth && cur > 0 {
-            let Some(b) = sys::basic(cur) else { break };
-            let d = self.details(cur, b.start);
-            chain.push(ChainEntry {
-                pid: cur,
-                uid: b.uid,
-                exe: d.exe.clone(),
-                argv: d.argv.clone(),
-                env: d.ctx.is_some(),
-            });
-            ctxs.push(d);
-            if cur == 1 || b.ppid == cur {
+            if chain.len() < self.depth {
+                let exe = sys::exe(cur).or_else(|| args.as_ref().and_then(|a| a.first().cloned()));
+                chain.push(ChainEntry {
+                    pid: cur,
+                    uid: b.uid,
+                    exe: exe.map(|e| cap(&e, MAX_EXE)),
+                    argv: args.as_deref().map(short_argv),
+                    env: env_ok,
+                });
+            }
+            if cur == 1 || b.ppid == cur || b.ppid <= 0 {
                 break;
             }
             cur = b.ppid;
         }
-        let mut context = BTreeMap::new();
-        // Oldest ancestor wins: iterate from the top of the tree down.
-        for (entry, d) in chain.iter().zip(&ctxs).rev() {
-            for (k, v) in d.ctx.iter().flatten() {
-                context.entry(k.clone()).or_insert(CtxValue {
-                    value: v.clone(),
-                    pid: entry.pid,
-                });
+        let mut context: BTreeMap<String, CtxValue> = BTreeMap::new();
+        // Oldest ancestor first.
+        for (i, value, pid) in found.into_iter().rev() {
+            let var = &self.vars[i];
+            match context.get_mut(var) {
+                None => {
+                    context.insert(
+                        var.clone(),
+                        CtxValue {
+                            value,
+                            pid,
+                            other: Vec::new(),
+                        },
+                    );
+                }
+                Some(c) => {
+                    if c.value != value
+                        && c.other.len() < MAX_CTX_VALUES - 1
+                        && !c.other.iter().any(|o| o.value == value)
+                    {
+                        c.other.push(CtxOther { value, pid });
+                    }
+                }
             }
         }
-        let peer_uid = chain.first().and_then(|e| e.uid);
-        let status = match chain.first() {
-            None => "unavailable",
-            Some(e) if !e.env => "unavailable",
-            _ if chain.iter().any(|e| e.uid == peer_uid && !e.env) => "partial",
-            _ => "ok",
+        let status = match first_env_ok {
+            None => {
+                return Attribution::unavailable(
+                    "the caller's process could not be read (it exited?)",
+                );
+            }
+            Some(false) => "unavailable",
+            Some(true) if unreadable_same_uid => "partial",
+            Some(true) => "ok",
         };
         Attribution {
-            status,
-            cwd: sys::cwd(pid),
+            status: status.into(),
+            error: (status == "unavailable")
+                .then(|| "the caller's environment could not be read".to_string()),
+            cwd: sys::cwd(pid).map(|c| cap(&c, MAX_CWD)),
             context,
             chain,
+            ancestors: walked,
+            chain_truncated: truncated,
         }
     }
 }
@@ -183,12 +296,7 @@ fn short_argv(args: &[String]) -> String {
         if i > 0 {
             s.push(' ');
         }
-        if a.chars().count() > MAX_ARG {
-            s.extend(a.chars().take(MAX_ARG));
-            s.push_str("...");
-        } else {
-            s.push_str(a);
-        }
+        s.push_str(&cap(a, MAX_ARG));
     }
     s
 }
@@ -198,6 +306,7 @@ mod sys {
     use super::{Basic, PeerCred};
     use std::fs;
     use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::fs::MetadataExt;
 
     pub fn peer_cred(fd: i32) -> io::Result<PeerCred> {
@@ -221,6 +330,49 @@ mod sys {
                 pid: cred.pid,
             })
         }
+    }
+
+    /// `SO_PEERPIDFD` (Linux 6.5+). Its value is 77 on the generic socket ABI used by
+    /// x86, ARM and RISC-V; other architectures fall back to start-time checks.
+    pub fn peer_pidfd(fd: i32) -> Option<OwnedFd> {
+        if !cfg!(any(
+            target_arch = "x86_64",
+            target_arch = "x86",
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "riscv64"
+        )) {
+            return None;
+        }
+        const SO_PEERPIDFD: libc::c_int = 77;
+        let mut pidfd: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: pidfd and len are valid out-pointers of the sizes passed.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                SO_PEERPIDFD,
+                (&mut pidfd as *mut libc::c_int).cast(),
+                &mut len,
+            )
+        };
+        // SAFETY: on success the kernel returned a new descriptor that we now own.
+        (rc == 0 && pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd) })
+    }
+
+    pub fn pidfd_alive(fd: &OwnedFd) -> bool {
+        // SAFETY: pidfd_send_signal with signal 0 only checks that the process exists.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd.as_raw_fd(),
+                0,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
     pub fn basic(pid: i32) -> Option<Basic> {
@@ -249,9 +401,11 @@ mod sys {
                 .map(|a| String::from_utf8_lossy(a).into_owned())
                 .collect()
         });
-        let env = fs::read(format!("/proc/{pid}/environ"))
-            .ok()
-            .map(|d| split_nul(&d));
+        let env = fs::read(format!("/proc/{pid}/environ")).ok().map(|mut d| {
+            let v = split_nul(&d);
+            zeroize::Zeroize::zeroize(&mut d);
+            v
+        });
         (args, env)
     }
 
@@ -271,8 +425,10 @@ mod sys {
 #[cfg(target_os = "macos")]
 mod sys {
     use super::{Basic, PeerCred};
+    use std::cell::RefCell;
     use std::io;
     use std::mem::{size_of, zeroed};
+    use std::os::fd::OwnedFd;
     use std::sync::OnceLock;
 
     pub fn peer_cred(fd: i32) -> io::Result<PeerCred> {
@@ -292,10 +448,18 @@ mod sys {
                 &mut len,
             );
             if rc != 0 {
-                return Err(io::Error::last_os_error());
+                pid = 0;
             }
             Ok(PeerCred { uid, gid, pid })
         }
+    }
+
+    pub fn peer_pidfd(_fd: i32) -> Option<OwnedFd> {
+        None
+    }
+
+    pub fn pidfd_alive(_fd: &OwnedFd) -> bool {
+        true
     }
 
     pub fn basic(pid: i32) -> Option<Basic> {
@@ -346,30 +510,40 @@ mod sys {
         })
     }
 
+    thread_local! {
+        /// Reused across calls so each lookup does not fault in a fresh ARG_MAX buffer.
+        static BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+
     /// argv and environment via `sysctl(KERN_PROCARGS2)`; only works for same-uid processes
     /// (or as root).
     pub fn args_env(pid: i32) -> (Option<Vec<String>>, Option<Vec<Vec<u8>>>) {
-        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
-        let mut buf = vec![0u8; argmax()];
-        let mut size = buf.len();
-        // SAFETY: buf is valid for `size` bytes; the kernel writes at most that much.
-        let rc = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                3,
-                buf.as_mut_ptr().cast(),
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if rc != 0 || size < 4 {
-            return (None, None);
-        }
-        buf.truncate(size);
-        parse_procargs(&buf)
-            .map(|(a, e)| (Some(a), Some(e)))
-            .unwrap_or((None, None))
+        BUF.with_borrow_mut(|buf| {
+            if buf.len() < argmax() {
+                buf.resize(argmax(), 0);
+            }
+            let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+            let mut size = buf.len();
+            // SAFETY: buf is valid for `size` bytes; the kernel writes at most that much.
+            let rc = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    3,
+                    buf.as_mut_ptr().cast(),
+                    &mut size,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if rc != 0 || size < 4 {
+                return (None, None);
+            }
+            let r = parse_procargs(&buf[..size])
+                .map(|(a, e)| (Some(a), Some(e)))
+                .unwrap_or((None, None));
+            zeroize::Zeroize::zeroize(&mut buf[..size]);
+            r
+        })
     }
 
     /// Layout: argc (i32), exec path, NUL padding, argv[argc], env..., empty string.
@@ -456,6 +630,8 @@ mod tests {
         if std::env::var_os("HOME").is_some() {
             assert!(at.context.contains_key("HOME"));
         }
+        assert!(a.attribute(0).is_unavailable());
+        assert!(a.attribute(i32::MAX - 1).is_unavailable());
     }
 
     #[cfg(target_os = "macos")]

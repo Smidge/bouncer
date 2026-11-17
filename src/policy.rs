@@ -1,6 +1,7 @@
-//! Release policy. Today bouncer ships only simple policies; the `Policy` trait is the hook
-//! for a future LLM judge (see ROADMAP in the README).
+//! Release policy. The daemon runs `RequireReason` for every read, then, if configured, the
+//! admission model (`admission::Admission`), which is also a `Policy`.
 
+use crate::audit::AdmissionRecord;
 use crate::peer::{Attribution, PeerCred};
 use crate::proto::Op;
 
@@ -15,6 +16,8 @@ pub struct SecretMeta<'a> {
 pub struct Caller<'a> {
     pub peer: PeerCred,
     pub attribution: &'a Attribution,
+    /// The primary value of the first configured context variable, if any.
+    pub thread: Option<&'a str>,
 }
 
 pub struct PolicyInput<'a> {
@@ -32,9 +35,27 @@ pub enum Decision {
     Deny(String),
 }
 
+/// A decision with its provenance, for the response and the audit entry.
+pub struct Verdict {
+    pub decision: Decision,
+    pub policy: &'static str,
+    /// Shown to the requester (the admission model's reasoning).
+    pub reasoning: Option<String>,
+    pub admission: Option<AdmissionRecord>,
+}
+
 pub trait Policy: Send + Sync {
     fn name(&self) -> &'static str;
     fn decide(&self, input: &PolicyInput) -> Decision;
+
+    fn verdict(&self, input: &PolicyInput) -> Verdict {
+        Verdict {
+            decision: self.decide(input),
+            policy: self.name(),
+            reasoning: None,
+            admission: None,
+        }
+    }
 }
 
 /// Releases everything. Accountability only comes from the audit log.
@@ -73,7 +94,7 @@ impl Policy for RequireReason {
     }
 }
 
-/// The policy used by the daemon: reads need a reason; writes are always allowed (and audited).
+/// The base policy used by the daemon: reads need a reason.
 pub fn default_policy(min_reason_len: usize) -> Box<dyn Policy> {
     Box::new(RequireReason {
         min_len: min_reason_len.max(1),
@@ -99,6 +120,7 @@ mod tests {
                     pid: 1,
                 },
                 attribution: at,
+                thread: None,
             },
             reason,
         }
@@ -115,5 +137,9 @@ mod tests {
         assert!(matches!(p.decide(&input("   ", &at)), Decision::Deny(_)));
         assert!(matches!(p.decide(&input("short", &at)), Decision::Deny(_)));
         assert_eq!(AllowAll.decide(&input("", &at)), Decision::Allow);
+        assert_eq!(
+            p.verdict(&input("deploying the docs site", &at)).policy,
+            "require-reason"
+        );
     }
 }

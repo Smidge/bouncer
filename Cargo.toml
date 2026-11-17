@@ -2,8 +2,8 @@
 name = "bouncer"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
-description = "A tiny local secret store for LLM agents: every fetch needs a reason and is written to a hash-chained audit log."
+rust-version = "1.88"
+description = "A tiny local secret store for LLM agents: every fetch needs a reason and is written to a keyed, hash-chained audit log."
 license = "MIT"
 repository = "https://github.com/Smidge/bouncer"
 readme = "README.md"
@@ -11,18 +11,23 @@ keywords = ["secrets", "audit", "llm", "agents", "vault"]
 categories = ["command-line-utilities", "cryptography"]
 
 [features]
-default = ["s3"]
-# Ship audit entries to an S3-compatible bucket (AWS, Cloudflare R2, iDrive E2, MinIO...).
-s3 = ["dep:ureq", "dep:md-5", "dep:hmac"]
+default = ["net"]
+# HTTP(S) client for the S3, InfluxDB and webhook sinks and the admission model.
+net = ["dep:ureq", "dep:md-5"]
+# Old name for `net`.
+s3 = ["net"]
 
 [dependencies]
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
 getrandom = "0.4.3"
-hmac = { version = "0.13.0", optional = true }
+# HMAC-SHA256 for the keyed audit chain, SigV4 and webhook signatures.
+hmac = "0.13.0"
 libc = "0.2.191"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
+# Wipes keys, plaintext and secret values from memory when they are dropped.
+zeroize = "1.9.1"
 md-5 = { version = "0.11.0", optional = true }
 ureq = { version = "3.5.2", default-features = false, features = ["rustls"], optional = true }
 

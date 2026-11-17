@@ -1,17 +1,24 @@
 //! Wire protocol: one JSON request line, one JSON response line, per Unix socket connection.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::err;
 use crate::util::Result;
 
-/// Largest request or response line accepted.
-pub const MAX_LINE: u64 = 4 << 20;
+/// Largest request line for anything but `set`.
+pub const MAX_FRAME: usize = 64 * 1024;
+/// Largest `set` request line (a value of `MAX_VALUE` bytes, JSON-escaped, fits).
+pub const MAX_SET_FRAME: usize = 2 * 1024 * 1024;
+/// Largest secret value.
+pub const MAX_VALUE: usize = 256 * 1024;
+/// Largest response line (e.g. `exec` with several values).
+pub const MAX_RESPONSE: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -21,6 +28,8 @@ pub enum Op {
     Set,
     Rm,
     Ls,
+    Status,
+    Verify,
 }
 
 impl Op {
@@ -31,12 +40,18 @@ impl Op {
             Op::Set => "set",
             Op::Rm => "rm",
             Op::Ls => "ls",
+            Op::Status => "status",
+            Op::Verify => "verify",
         }
     }
 
-    /// Reads release secret values to the caller.
+    /// Releases secret values to the caller.
     pub fn is_read(self) -> bool {
         matches!(self, Op::Get | Op::Exec)
+    }
+
+    pub fn is_write(self) -> bool {
+        matches!(self, Op::Set | Op::Rm)
     }
 }
 
@@ -48,11 +63,31 @@ pub struct Request {
     #[serde(default)]
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
+    pub value: Option<SecretValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desc: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// `verify`: an anchored head, `SEQ:HASH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_head: Option<String>,
+}
+
+/// A secret value in transit: wiped on drop, never printed by `Debug`.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretValue(pub String);
+
+impl Drop for SecretValue {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[secret]")
+    }
 }
 
 impl Request {
@@ -64,6 +99,7 @@ impl Request {
             value: None,
             desc: None,
             tags: Vec::new(),
+            expect_head: None,
         }
     }
 }
@@ -83,6 +119,9 @@ pub const E_BAD_REQUEST: &str = "bad_request";
 pub const E_DENIED: &str = "denied";
 pub const E_NOT_FOUND: &str = "not_found";
 pub const E_INTERNAL: &str = "internal";
+pub const E_AUDIT: &str = "audit_failed";
+pub const E_BUSY: &str = "busy";
+pub const E_VERIFY: &str = "verify_failed";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Response {
@@ -92,9 +131,14 @@ pub struct Response {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub values: Vec<String>,
+    pub values: Vec<SecretValue>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub list: Vec<ListItem>,
+    /// The admission model's reasoning, when it was consulted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<serde_json::Value>,
 }
 
 impl Response {
@@ -106,30 +150,158 @@ impl Response {
             ..Default::default()
         }
     }
+
+    /// Serialises to one line; the buffer is wiped on drop.
+    pub fn encode(&self) -> Zeroizing<Vec<u8>> {
+        let mut line =
+            Zeroizing::new(serde_json::to_vec(self).unwrap_or_else(|_| b"{\"ok\":false}".to_vec()));
+        line.push(b'\n');
+        line
+    }
 }
 
-/// Reads one newline-terminated line, capped at `MAX_LINE` bytes.
-pub fn read_line(stream: &UnixStream) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    BufReader::new(stream.take(MAX_LINE)).read_until(b'\n', &mut buf)?;
-    Ok(buf)
+#[derive(Debug)]
+pub enum FrameError {
+    TooLarge(usize),
+    /// The peer closed the connection before a newline.
+    Unterminated,
+    Timeout,
+    Io(io::Error),
 }
 
-/// Sends one request to the daemon and returns its response.
-pub fn call(socket: &Path, req: &Request) -> Result<Response> {
-    let mut stream = UnixStream::connect(socket).map_err(|e| {
-        err!(
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameError::TooLarge(n) => write!(f, "request is larger than {n} bytes"),
+            FrameError::Unterminated => f.write_str("request is not newline-terminated"),
+            FrameError::Timeout => f.write_str("request was not received in time"),
+            FrameError::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Reads one newline-terminated line before `deadline` (a deadline for the whole line, not
+/// per read). Lines starting with `{"op":"set"` may be up to `large`, others up to `small`.
+pub fn read_frame(
+    stream: &UnixStream,
+    deadline: Instant,
+    small: usize,
+    large: usize,
+) -> std::result::Result<Zeroizing<Vec<u8>>, FrameError> {
+    let mut buf = Zeroizing::new(Vec::with_capacity(512));
+    let mut chunk = Zeroizing::new([0u8; 8192]);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(FrameError::Timeout);
+        }
+        stream
+            .set_read_timeout(Some(left))
+            .map_err(FrameError::Io)?;
+        match (&*stream).read(&mut chunk[..]) {
+            Ok(0) => return Err(FrameError::Unterminated),
+            Ok(n) => {
+                let nl = chunk[..n].iter().position(|&b| b == b'\n');
+                buf.extend_from_slice(&chunk[..nl.unwrap_or(n)]);
+                let limit = if buf.starts_with(b"{\"op\":\"set\"") {
+                    large
+                } else {
+                    small
+                };
+                if buf.len() > limit {
+                    return Err(FrameError::TooLarge(limit));
+                }
+                if nl.is_some() {
+                    return Ok(buf);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(FrameError::Timeout);
+            }
+            Err(e) => return Err(FrameError::Io(e)),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum CallError {
+    /// Could not connect or talk to the daemon.
+    Unreachable(String),
+    /// Something is listening, but not as the expected uid.
+    Identity(String),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallError::Unreachable(m) | CallError::Identity(m) => f.write_str(m),
+        }
+    }
+}
+
+/// Sends one request to the daemon and returns its response. Before sending anything the
+/// client checks that the socket's owner process runs as `server_uid`, so a socket planted
+/// by another user never sees a request (or a `set` value).
+pub fn call(
+    socket: &Path,
+    server_uid: u32,
+    req: &Request,
+    timeout: Duration,
+) -> std::result::Result<Response, CallError> {
+    let stream = UnixStream::connect(socket).map_err(|e| {
+        CallError::Unreachable(format!(
             "cannot connect to the bouncer daemon at {} ({e}). Is `bouncer serve` running?",
             socket.display()
-        )
+        ))
     })?;
-    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-    let mut line = serde_json::to_vec(req).map_err(|_| err!("cannot encode request"))?;
-    line.push(b'\n');
-    stream.write_all(&line)?;
-    let resp = read_line(&stream)?;
-    if resp.is_empty() {
-        return Err(err!("daemon closed the connection without answering"));
+    let peer = crate::peer::peer_cred(&stream).map_err(|e| {
+        CallError::Identity(format!("cannot check who owns {}: {e}", socket.display()))
+    })?;
+    if peer.uid != server_uid {
+        return Err(CallError::Identity(format!(
+            "the process listening on {} runs as uid {}, not the expected uid {server_uid}; refusing to talk to it \
+             (set server_uid in the config or BOUNCER_SERVER_UID if the daemon runs as another user)",
+            socket.display(),
+            peer.uid
+        )));
     }
-    serde_json::from_slice(&resp).map_err(|_| err!("malformed response from daemon"))
+    let io = |e: io::Error| CallError::Unreachable(format!("talking to the daemon: {e}"));
+    stream.set_write_timeout(Some(timeout)).map_err(io)?;
+    let mut line = Zeroizing::new(
+        serde_json::to_vec(req)
+            .map_err(|_| CallError::Unreachable("cannot encode request".into()))?,
+    );
+    line.push(b'\n');
+    (&stream).write_all(&line).map_err(io)?;
+    let resp = match read_frame(
+        &stream,
+        Instant::now() + timeout,
+        MAX_RESPONSE,
+        MAX_RESPONSE,
+    ) {
+        Ok(r) => r,
+        Err(FrameError::Unterminated) => {
+            return Err(CallError::Unreachable(
+                "daemon closed the connection without answering".into(),
+            ));
+        }
+        Err(e) => {
+            return Err(CallError::Unreachable(format!(
+                "reading the daemon's answer: {e}"
+            )));
+        }
+    };
+    serde_json::from_slice(&resp)
+        .map_err(|_| CallError::Unreachable("malformed response from daemon".into()))
+}
+
+/// Convenience for internal callers that want a plain error.
+pub fn call_simple(socket: &Path, server_uid: u32, req: &Request) -> Result<Response> {
+    call(socket, server_uid, req, Duration::from_secs(60)).map_err(|e| err!("{e}"))
 }

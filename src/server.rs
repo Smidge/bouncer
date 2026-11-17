@@ -1,189 +1,733 @@
-//! The daemon: holds the decrypted vault in memory and answers requests on a Unix socket,
-//! one thread per connection. Every get/exec/set/rm is written to the audit log before the
-//! response is sent; if the audit write fails, no secret is released.
+//! The daemon: holds the decrypted vault in memory and answers requests on a Unix socket.
+//!
+//! Per connection: the peer's uid is checked right after accept, and connections from other
+//! uids are closed before anything is read. Then the caller is attributed (before the
+//! request is read, so it cannot exit or exec first), the request is read against one
+//! deadline, decided, written to the audit log, and only then answered. If the audit write
+//! fails, nothing is released and the daemon stays in a failed state until repaired.
+//!
+//! Mutations are serialised: the audit entry (with a transaction id, the new vault
+//! generation and the new file's hash) is written first, then the vault file, then the
+//! in-memory copy is swapped. If saving fails, an `abort` entry records it and the in-memory
+//! vault is unchanged, so readers never see a change that is not in the log.
 
-use std::fs;
-use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::net::Shutdown;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::time::{Duration, Instant};
 
-use crate::audit::{AuditLog, Entry};
+use crate::audit::{self, AuditLog, Entry, VaultState};
 use crate::config::{Config, FsyncMode};
 use crate::err;
-use crate::peer::{Attribution, Attributor, PeerCred, peer_cred};
-use crate::policy::{Caller, Decision, Policy, PolicyInput, SecretMeta, default_policy};
+use crate::peer::{Attribution, Attributor, Caller, PeerCred};
+use crate::policy::{self, Decision, Policy, PolicyInput, SecretMeta, Verdict};
 use crate::proto::{
-    E_BAD_REQUEST, E_DENIED, E_INTERNAL, E_NOT_FOUND, ListItem, Op, Request, Response, read_line,
+    self, E_AUDIT, E_BAD_REQUEST, E_BUSY, E_DENIED, E_INTERNAL, E_NOT_FOUND, E_VERIFY, ListItem,
+    Op, Request, Response, SecretValue,
 };
-use crate::util::{self, Result, ctx};
-use crate::vault::{Key, Secret, Vault, load_key, valid_name};
+use crate::sink::{self, StatusHandle};
+use crate::util::{self, Dir, Result, ctx};
+use crate::vault::{self, Key, Secret, Vault, valid_name};
 
 const MAX_NAMES: usize = 64;
-const MAX_REASON: usize = 2000;
+const MAX_REASON: usize = 1000;
 const MAX_DESC: usize = 500;
+const MAX_TAGS: usize = 16;
+const WORKER_STACK: usize = 512 * 1024;
+const REJECT_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A secret's (name, description, tags).
+type Meta = (String, Option<String>, Vec<String>);
+
+#[derive(Default)]
+pub struct Options {
+    /// Start even if the vault does not match the audit log (recorded in the log).
+    pub accept_vault_mismatch: bool,
+}
+
+enum AttrSource {
+    Local(Attributor),
+    #[cfg(target_os = "linux")]
+    Inspector(crate::privsep::Inspector),
+}
+
+#[derive(Default)]
+struct Rejects {
+    count: u64,
+    uids: BTreeSet<u32>,
+    last_logged: Option<Instant>,
+}
+
+struct Job {
+    stream: UnixStream,
+    caller: Caller,
+    admin_socket: bool,
+}
 
 pub struct Server {
     cfg: Config,
     key: Key,
     vault: RwLock<Vault>,
+    vault_dir: Dir,
+    vault_name: OsString,
     audit: Mutex<AuditLog>,
-    policy: Box<dyn Policy>,
-    attributor: Attributor,
+    shared: Arc<audit::Shared>,
+    write_lock: Mutex<()>,
+    base: Box<dyn Policy>,
+    admission: Option<Box<dyn Policy>>,
+    attr: AttrSource,
     host: String,
+    rejects: Mutex<Rejects>,
+    rejected_total: AtomicU64,
+    sinks: Vec<StatusHandle>,
+    started: String,
+    inflight: AtomicUsize,
+    pool: Pool,
+    _lock: File,
 }
 
-pub fn serve(cfg: Config) -> Result<()> {
-    let key = load_key(&cfg.key)?;
-    let vault = Vault::load(&cfg.vault, &key)?;
-    let audit = AuditLog::open(&cfg.audit_log, cfg.audit_fsync == FsyncMode::Strict)?;
-    let listener = bind(&cfg.socket, cfg.socket_mode)?;
-    let count = vault.secrets.len();
-    let server = Arc::new(Server {
-        policy: default_policy(cfg.min_reason_len),
-        attributor: Attributor::new(cfg.context_vars.clone(), cfg.max_chain_depth),
-        host: util::hostname(),
-        key,
-        vault: RwLock::new(vault),
-        audit: Mutex::new(audit),
-        cfg,
-    });
-    start_s3(&server);
-    eprintln!(
-        "bouncer: serving {count} secret(s) on {}",
-        server.cfg.socket.display()
-    );
-    for conn in listener.incoming() {
-        match conn {
-            Ok(stream) => {
-                let srv = server.clone();
-                std::thread::spawn(move || srv.handle(stream));
-            }
-            Err(e) => eprintln!("bouncer: accept failed: {e}"),
+/// Takes the store's exclusive lock (`bouncer.lock` next to the vault) for as long as the
+/// returned file is open. A second daemon, `init` or `repair` on the same store fails.
+pub fn lock_store(cfg: &Config) -> Result<File> {
+    let (dir, _) = util::split_path(&cfg.vault)?;
+    let dir = Dir::secure(&dir, true)?;
+    let path = cfg.lock_path();
+    let f = ctx(
+        dir.open_at("bouncer.lock".as_ref(), libc::O_RDWR | libc::O_CREAT, 0o600),
+        "cannot open lock file",
+        &path,
+    )?;
+    util::check_data_file(&f.metadata()?, &path)?;
+    // SAFETY: flock on an fd we own.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(err!(
+            "another bouncer process (daemon, init or repair) is using the store in {}",
+            dir.path().display()
+        ));
+    }
+    Ok(f)
+}
+
+/// Binds a socket in a verified directory. An existing path is only removed if it is a
+/// socket owned by us that nobody is listening on.
+fn bind(path: &Path, mode: u32, group: Option<u32>) -> Result<UnixListener> {
+    let (dir, name) = util::split_path(path)?;
+    let d = Dir::secure(&dir, false)?;
+    if let Some(st) = d.lstat(name)? {
+        #[allow(clippy::unnecessary_cast)] // mode_t is u16 on macOS, u32 on Linux
+        let is_sock = (st.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFSOCK as u32;
+        if !is_sock || st.st_uid != util::geteuid() {
+            return Err(err!(
+                "{} exists and is not a socket owned by uid {}; refusing to remove it",
+                path.display(),
+                util::geteuid()
+            ));
         }
-    }
-    Ok(())
-}
-
-#[cfg(feature = "s3")]
-fn start_s3(server: &Arc<Server>) {
-    let Some(s3) = server.cfg.s3.clone() else {
-        return;
-    };
-    let srv = server.clone();
-    let (ak, sk) = (
-        s3.access_key_id_secret.clone(),
-        s3.secret_access_key_secret.clone(),
-    );
-    crate::s3::Uploader {
-        log: server.cfg.audit_log.clone(),
-        cursor: server.cfg.s3_cursor(),
-        host: server.host.clone(),
-        notify: server.audit.lock().unwrap().notify.clone(),
-        creds: Box::new(move || {
-            let v = srv.vault.read().unwrap();
-            Some(crate::s3::Credentials {
-                access_key_id: v.secrets.get(&ak)?.value.clone(),
-                secret_access_key: v.secrets.get(&sk)?.value.clone(),
-            })
-        }),
-        cfg: s3,
-    }
-    .spawn();
-}
-
-#[cfg(not(feature = "s3"))]
-fn start_s3(server: &Arc<Server>) {
-    if server.cfg.s3.is_some() {
-        eprintln!("bouncer: [s3] is configured but this build has no s3 feature; ignoring");
-    }
-}
-
-fn bind(path: &Path, mode: u32) -> Result<UnixListener> {
-    if let Some(dir) = path.parent() {
-        util::ensure_dir(dir, 0o700)?;
-    }
-    if path.exists() {
         if UnixStream::connect(path).is_ok() {
             return Err(err!(
                 "another bouncer daemon is already listening on {}",
                 path.display()
             ));
         }
-        ctx(fs::remove_file(path), "cannot remove stale socket", path)?;
+        ctx(d.unlink(name), "cannot remove stale socket", path)?;
     }
-    // Create the socket owner-only, then widen to the configured mode.
+    // The socket is created with 0777 & ~umask, so set the umask to give exactly `mode`.
+    // No other thread creates files at this point.
     // SAFETY: umask only swaps the process file-mode mask.
-    let old = unsafe { libc::umask(0o177) };
+    let old = unsafe { libc::umask((0o777 & !mode) as libc::mode_t) };
     let listener = UnixListener::bind(path);
     // SAFETY: as above.
     unsafe { libc::umask(old) };
     let listener = ctx(listener, "cannot listen on", path)?;
-    ctx(
-        fs::set_permissions(path, fs::Permissions::from_mode(mode)),
-        "cannot chmod",
-        path,
-    )?;
+    if let Some(g) = group {
+        ctx(
+            d.chown(name, None, Some(g)),
+            "cannot set the socket's group",
+            path,
+        )?;
+    }
     Ok(listener)
 }
 
-fn bad(msg: impl Into<String>) -> Response {
-    Response::fail(E_BAD_REQUEST, msg)
+/// Prepares a socket directory while still root (dedicated-user mode): creates it if
+/// needed and hands it to the daemon user.
+#[cfg(target_os = "linux")]
+fn prepare_socket_dir(path: &Path, uid: u32, group: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+    let (dir, _) = util::split_path(path)?;
+    if std::fs::symlink_metadata(&dir).is_err() {
+        ctx(
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir),
+            "cannot create",
+            &dir,
+        )?;
+    }
+    let f = ctx(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&dir),
+        "cannot open",
+        &dir,
+    )?;
+    let m = f.metadata()?;
+    if m.uid() != 0 && m.uid() != uid {
+        return Err(err!(
+            "{} is owned by uid {}; refusing to use it",
+            dir.display(),
+            m.uid()
+        ));
+    }
+    let mode = if group.is_some() { 0o710 } else { 0o700 };
+    // chmod while still the owner (no CAP_FOWNER needed), then hand it over.
+    // SAFETY: fchmod/fchown on an fd we own.
+    unsafe {
+        if libc::fchmod(f.as_raw_fd(), mode) != 0
+            || libc::fchown(f.as_raw_fd(), uid, group.unwrap_or(u32::MAX)) != 0
+        {
+            return Err(err!(
+                "cannot hand {} to uid {uid}: {}",
+                dir.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
 }
 
-/// What an operation did, for the audit entry.
-struct Outcome {
-    decision: Decision,
-    result: &'static str,
-    policy: &'static str,
+/// Runs the daemon until killed.
+#[allow(unused_mut)]
+pub fn serve(mut cfg: Config, opts: Options) -> Result<()> {
+    let mut preloaded_key = None;
+    let attr;
+    if util::geteuid() == 0 {
+        #[cfg(target_os = "linux")]
+        {
+            let Some(user) = cfg.user.clone() else {
+                return Err(err!(
+                    "refusing to run as root. Set `user = \"bouncer\"` in the config to start as root \
+                     and drop to that user (see contrib/bouncer.service), or run as an ordinary user"
+                ));
+            };
+            let (uid, gid) = crate::config::lookup_user(&user)?;
+            if uid == 0 {
+                return Err(err!("`user` must not be root"));
+            }
+            let group = cfg
+                .socket_group
+                .as_deref()
+                .map(crate::config::lookup_group)
+                .transpose()?;
+            // Fork the inspector first, while the process is single-threaded and holds nothing.
+            let inspector = crate::privsep::spawn_inspector(
+                uid,
+                gid,
+                Attributor::new(cfg.context_vars.clone(), cfg.max_chain_depth),
+            )?;
+            attr = AttrSource::Inspector(inspector);
+            if cfg.mlock {
+                crate::harden::raise_memlock();
+            }
+            for s in cfg.secret_refs() {
+                s.preload()?;
+            }
+            if let crate::config::KeySource::Credential(_) = cfg.key {
+                preloaded_key = Some(vault::load_key(&cfg.key)?);
+            }
+            prepare_socket_dir(&cfg.socket, uid, group)?;
+            if let Some(a) = &cfg.admin_socket
+                && a.parent() != cfg.socket.parent()
+            {
+                prepare_socket_dir(a, uid, None)?;
+            }
+            crate::privsep::drop_privileges(uid, gid, group)?;
+            cfg.rebase_uid_defaults(uid);
+            eprintln!(
+                "bouncer: dropped privileges to {user} (uid {uid}); attribution runs in a separate helper"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(err!(
+                "refusing to run as root; run bouncer as an ordinary user"
+            ));
+        }
+    } else {
+        attr = AttrSource::Local(Attributor::new(
+            cfg.context_vars.clone(),
+            cfg.max_chain_depth,
+        ));
+    }
+
+    crate::harden::disable_core_dumps();
+    if cfg.deny_debugger {
+        crate::harden::deny_debugger();
+    }
+    if cfg.mlock
+        && let Some(w) = crate::harden::lock_memory()
+    {
+        eprintln!("bouncer: warning: {w}");
+    }
+
+    let lock = lock_store(&cfg)?;
+    let key = match preloaded_key {
+        Some(k) => k,
+        None => vault::load_key(&cfg.key)?,
+    };
+    let (vdir, vname) = util::split_path(&cfg.vault)?;
+    let vault_dir = Dir::secure(&vdir, true)?;
+    let vault_name = vname.to_os_string();
+    let (vault, file_hash) = Vault::load(&vault_dir, &vault_name, &key)?;
+    let (mut log, verified) = AuditLog::open(
+        &cfg.audit_log,
+        vault::chain_key(&key),
+        cfg.audit_fsync == FsyncMode::Strict,
+    )?;
+    let host = util::hostname();
+    let found = VaultState {
+        generation: vault.generation,
+        hash: file_hash,
+    };
+    check_vault_state(
+        &mut log,
+        &verified,
+        &found,
+        &host,
+        opts.accept_vault_mismatch,
+    )?;
+    let mut start = Entry::new("start", &host);
+    start.vault_gen = Some(found.generation);
+    start.note = Some(format!(
+        "bouncer {} pid {} uid {}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        util::geteuid()
+    ));
+    log.append(start)?;
+
+    let group = cfg
+        .socket_group
+        .as_deref()
+        .map(crate::config::lookup_group)
+        .transpose()?;
+    let listener = bind(&cfg.socket, cfg.socket_mode, group)?;
+    let admin_listener = match &cfg.admin_socket {
+        Some(p) => Some(bind(p, 0o600, None)?),
+        None => None,
+    };
+
+    let shared = log.shared.clone();
+    let mut sinks = Vec::new();
+    for s in &cfg.sinks {
+        let (sc, h, vars) = (s.clone(), host.clone(), cfg.context_vars.clone());
+        let factory = Box::new(move || sink::build(&sc, &h, &vars));
+        factory().map_err(|e| err!("sink {}: {e}", s.name))?; // fail fast on bad config
+        sinks.push(sink::spawn(
+            s.name.clone(),
+            s.kind.type_name(),
+            factory,
+            cfg.audit_log.clone(),
+            cfg.sink_cursor(&s.name),
+            shared.clone(),
+        )?);
+    }
+    let admission = build_admission(&cfg)?;
+    let count = vault.secrets.len();
+    let server = Arc::new(Server {
+        base: policy::default_policy(cfg.min_reason_len),
+        admission,
+        attr,
+        host,
+        key,
+        vault: RwLock::new(vault),
+        vault_dir,
+        vault_name,
+        audit: Mutex::new(log),
+        shared,
+        write_lock: Mutex::new(()),
+        rejects: Mutex::new(Rejects::default()),
+        rejected_total: AtomicU64::new(0),
+        sinks,
+        started: util::rfc3339_ms(util::now_ms()),
+        inflight: AtomicUsize::new(0),
+        pool: Pool::new(cfg.max_connections),
+        _lock: lock,
+        cfg,
+    });
+    {
+        let srv = server.clone();
+        std::thread::Builder::new()
+            .name("housekeeping".into())
+            .stack_size(WORKER_STACK)
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(REJECT_LOG_INTERVAL);
+                    srv.flush_rejects();
+                }
+            })
+            .map_err(|e| err!("cannot start housekeeping thread: {e}"))?;
+    }
+    if let Some(l) = admin_listener {
+        let srv = server.clone();
+        std::thread::Builder::new()
+            .name("admin-accept".into())
+            .stack_size(WORKER_STACK)
+            .spawn(move || accept_loop(&srv, &l, true))
+            .map_err(|e| err!("cannot start admin socket thread: {e}"))?;
+    }
+    eprintln!(
+        "bouncer: serving {count} secret(s) on {}",
+        server.cfg.socket.display()
+    );
+    accept_loop(&server, &listener, false);
+    Ok(())
+}
+
+#[cfg(feature = "net")]
+fn build_admission(cfg: &Config) -> Result<Option<Box<dyn Policy>>> {
+    cfg.admission
+        .clone()
+        .map(|a| crate::admission::Admission::new(a).map(|x| Box::new(x) as Box<dyn Policy>))
+        .transpose()
+}
+
+#[cfg(not(feature = "net"))]
+fn build_admission(cfg: &Config) -> Result<Option<Box<dyn Policy>>> {
+    if cfg.admission.is_some() {
+        return Err(err!(
+            "[admission] needs the `net` feature; this build has no HTTP client"
+        ));
+    }
+    Ok(None)
+}
+
+/// Compares the vault file with the last state the audit log committed to.
+fn check_vault_state(
+    log: &mut AuditLog,
+    v: &audit::Verified,
+    found: &VaultState,
+    host: &str,
+    accept: bool,
+) -> Result<()> {
+    let st = &v.state;
+    if st.current.as_ref() == Some(found) {
+        return Ok(());
+    }
+    let expected = match &st.current {
+        Some(s) => format!(
+            "generation {} (sha256 {})",
+            s.generation,
+            &s.hash[..16.min(s.hash.len())]
+        ),
+        None => "no vault state (the log is empty or has no init entry)".into(),
+    };
+    let msg = format!(
+        "the vault file (generation {}, sha256 {}) does not match the audit log, which expects {expected}. \
+         The vault may have been rolled back or replaced, or the log truncated",
+        found.generation,
+        &found.hash[..16]
+    );
+    // A crash between logging a change and saving the vault looks the same as rolling the
+    // vault back by one change, so it is not recovered automatically.
+    let crash_hint = match &st.last_txn {
+        Some((txn, before, seq)) if *seq == v.head.seq && before.as_ref() == Some(found) => {
+            format!(
+                ". The vault matches the state before the last logged change (txn {txn}); that is what a crash while saving it looks like"
+            )
+        }
+        _ => String::new(),
+    };
+    let msg = format!("{msg}{crash_hint}");
+    if !accept {
+        return Err(err!(
+            "{msg}. Refusing to serve. If you know why (for example you restored a backup), start once with \
+             `bouncer serve --accept-vault-mismatch`; that is recorded in the audit log"
+        ));
+    }
+    eprintln!("bouncer: warning: {msg}; continuing because of --accept-vault-mismatch");
+    let mut e = Entry::new("accept_vault_mismatch", host);
+    e.vault_gen = Some(found.generation);
+    e.vault_hash = Some(found.hash.clone());
+    e.note = Some(format!("expected {expected}"));
+    log.append(e)?;
+    Ok(())
+}
+
+fn accept_loop(srv: &Arc<Server>, listener: &UnixListener, admin: bool) {
+    let mut backoff = Duration::from_millis(10);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                backoff = Duration::from_millis(10);
+                srv.dispatch(stream, admin);
+            }
+            Err(e) => {
+                // Out of descriptors or memory: wait instead of spinning.
+                let scarce = matches!(
+                    e.raw_os_error(),
+                    Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+                );
+                if scarce {
+                    eprintln!("bouncer: accept failed ({e}); backing off {backoff:?}");
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_secs(1));
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+}
+
+/// Writes a short answer without reading anything, then closes.
+fn answer_and_close(stream: &UnixStream, resp: Response) {
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+    let _ = (&*stream).write_all(&resp.encode());
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
+/// A pool of worker threads that grows on demand up to `max`.
+struct Pool {
+    tx: Mutex<mpsc::Sender<Job>>,
+    rx: Arc<Mutex<mpsc::Receiver<Job>>>,
+    idle: AtomicUsize,
+    total: AtomicUsize,
+    max: usize,
+}
+
+impl Pool {
+    fn new(max: usize) -> Pool {
+        let (tx, rx) = mpsc::channel();
+        Pool {
+            tx: Mutex::new(tx),
+            rx: Arc::new(Mutex::new(rx)),
+            idle: AtomicUsize::new(0),
+            total: AtomicUsize::new(0),
+            max,
+        }
+    }
 }
 
 impl Server {
-    fn handle(&self, stream: UnixStream) {
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-        let resp = self.process(&stream);
-        let mut line = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{\"ok\":false}".to_vec());
-        line.push(b'\n');
-        let _ = (&stream).write_all(&line);
+    fn dispatch(self: &Arc<Self>, stream: UnixStream, admin: bool) {
+        let caller = match Caller::identify(&stream) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let uid = caller.cred.uid;
+        let ok = if admin {
+            self.cfg.admin_uids.contains(&uid)
+        } else {
+            self.cfg.may_connect(uid)
+        };
+        if !ok {
+            self.reject(uid);
+            answer_and_close(
+                &stream,
+                Response::fail(E_DENIED, format!("uid {uid} may not use this daemon")),
+            );
+            return;
+        }
+        if self.inflight.fetch_add(1, Ordering::AcqRel) >= self.cfg.max_connections {
+            self.inflight.fetch_sub(1, Ordering::AcqRel);
+            answer_and_close(
+                &stream,
+                Response::fail(E_BUSY, "too many concurrent connections; try again"),
+            );
+            return;
+        }
+        let job = Job {
+            stream,
+            caller,
+            admin_socket: admin,
+        };
+        if let Err(job) = self.submit(job) {
+            self.inflight.fetch_sub(1, Ordering::AcqRel);
+            answer_and_close(
+                &job.stream,
+                Response::fail(E_BUSY, "cannot start a worker; try again"),
+            );
+        }
     }
 
-    fn process(&self, stream: &UnixStream) -> Response {
-        let peer = match peer_cred(stream) {
-            Ok(p) => p,
-            Err(e) => return Response::fail(E_INTERNAL, format!("cannot identify caller: {e}")),
+    fn submit(self: &Arc<Self>, job: Job) -> std::result::Result<(), Job> {
+        let p = &self.pool;
+        if p.idle.load(Ordering::Acquire) == 0 && p.total.load(Ordering::Acquire) < p.max {
+            let srv = self.clone();
+            let spawned = std::thread::Builder::new()
+                .name("worker".into())
+                .stack_size(WORKER_STACK)
+                .spawn(move || srv.worker());
+            match spawned {
+                Ok(_) => {
+                    p.total.fetch_add(1, Ordering::AcqRel);
+                }
+                Err(e) => {
+                    eprintln!("bouncer: cannot start a worker thread: {e}");
+                    if p.total.load(Ordering::Acquire) == 0 {
+                        return Err(job);
+                    }
+                }
+            }
+        }
+        let tx = p.tx.lock().unwrap_or_else(|e| e.into_inner());
+        tx.send(job).map_err(|e| e.0)
+    }
+
+    fn worker(self: Arc<Self>) {
+        loop {
+            self.pool.idle.fetch_add(1, Ordering::AcqRel);
+            let job = self
+                .pool
+                .rx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .recv();
+            self.pool.idle.fetch_sub(1, Ordering::AcqRel);
+            let Ok(job) = job else { return };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handle(&job)));
+            self.inflight.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    fn reject(&self, uid: u32) {
+        self.rejected_total.fetch_add(1, Ordering::Relaxed);
+        let mut r = self.rejects.lock().unwrap_or_else(|e| e.into_inner());
+        r.count += 1;
+        if r.uids.len() < 16 {
+            r.uids.insert(uid);
+        }
+        drop(r);
+        self.flush_rejects();
+    }
+
+    /// Writes at most one `reject` entry per interval, summarising rejected connections.
+    fn flush_rejects(&self) {
+        let mut r = self.rejects.lock().unwrap_or_else(|e| e.into_inner());
+        let due = r
+            .last_logged
+            .is_none_or(|t| t.elapsed() >= REJECT_LOG_INTERVAL);
+        if r.count == 0 || !due {
+            return;
+        }
+        let mut e = Entry::new("reject", &self.host);
+        e.count = std::mem::take(&mut r.count);
+        e.uids = std::mem::take(&mut r.uids).into_iter().collect();
+        e.note = Some("connections from uids not allowed to connect; closed before reading".into());
+        r.last_logged = Some(Instant::now());
+        drop(r);
+        let _ = self
+            .audit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append(e);
+    }
+
+    fn attribute(&self, caller: &Caller) -> Attribution {
+        let pid = caller.cred.pid;
+        if pid <= 0 {
+            return Attribution::unavailable(
+                "the kernel did not report the caller's pid (another pid namespace?)",
+            );
+        }
+        let at = match &self.attr {
+            AttrSource::Local(a) => a.attribute(pid),
+            #[cfg(target_os = "linux")]
+            AttrSource::Inspector(i) => i.attribute(pid),
         };
-        let req: Request = match read_line(stream)
-            .ok()
-            .and_then(|l| serde_json::from_slice(&l).ok())
-        {
-            Some(r) => r,
+        if !caller.still_same() {
+            return Attribution::unavailable(
+                "the caller exited or was replaced during attribution",
+            );
+        }
+        at
+    }
+
+    fn handle(&self, job: &Job) {
+        let deadline = Instant::now() + self.cfg.request_timeout;
+        let at = self.attribute(&job.caller);
+        let resp = match proto::read_frame(
+            &job.stream,
+            deadline,
+            proto::MAX_FRAME,
+            proto::MAX_SET_FRAME,
+        ) {
+            Err(e) => Response::fail(E_BAD_REQUEST, e.to_string()),
             // Never echo the parse error: a malformed `set` could contain the value.
-            None => return bad("malformed request"),
+            Ok(buf) => match serde_json::from_slice::<Request>(&buf) {
+                Err(_) => Response::fail(E_BAD_REQUEST, "malformed request"),
+                Ok(req) => self.process(req, job, &at),
+            },
         };
+        let left = deadline.saturating_duration_since(Instant::now());
+        let _ = job
+            .stream
+            .set_write_timeout(Some(left.max(Duration::from_secs(1))));
+        let _ = (&job.stream).write_all(&resp.encode());
+        let _ = job.stream.shutdown(Shutdown::Write);
+        // Let the client read the answer before the socket closes.
+        let _ = job
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(100)));
+        let _ = (&job.stream).read(&mut [0u8; 1]);
+    }
+
+    fn process(&self, req: Request, job: &Job, at: &Attribution) -> Response {
         if let Some(msg) = validate(&req) {
-            return bad(msg);
+            return Response::fail(E_BAD_REQUEST, msg);
         }
-        let allowed = self.cfg.allowed_uids.contains(&peer.uid);
+        let peer = job.caller.cred;
         match req.op {
-            Op::Ls if allowed => self.list(),
-            Op::Ls => Response::fail(
-                E_DENIED,
-                format!("uid {} may not use this daemon", peer.uid),
-            ),
-            Op::Get | Op::Exec => self.read(&req, peer, allowed),
-            Op::Set | Op::Rm => self.write(req, peer, allowed),
+            Op::Status => self.status(),
+            Op::Verify => self.verify(&req, peer),
+            Op::Ls => self.list(&req, peer, at),
+            Op::Get | Op::Exec => self.read(&req, peer, at),
+            Op::Set | Op::Rm => self.write(&req, peer, at, job.admin_socket),
         }
     }
 
-    fn list(&self) -> Response {
-        let v = self.vault.read().unwrap();
-        Response {
-            ok: true,
-            list: v
-                .secrets
+    fn audit_failed(&self) -> Option<Response> {
+        self.shared.failed().map(|why| {
+            Response::fail(
+                E_AUDIT,
+                format!("the audit log failed ({why}); nothing is released until `bouncer repair` and a restart"),
+            )
+        })
+    }
+
+    fn entry(&self, req: &Request, peer: PeerCred, at: &Attribution) -> Entry {
+        let mut e = Entry::new(req.op.as_str(), &self.host);
+        e.names = req.names.clone();
+        e.reason = req.reason.trim().to_string();
+        e.peer = Some(peer);
+        e.attribution = Some(at.clone());
+        e
+    }
+
+    fn append(&self, e: Entry) -> Result<audit::Head> {
+        self.audit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append(e)
+    }
+
+    fn list(&self, req: &Request, peer: PeerCred, at: &Attribution) -> Response {
+        if let Some(r) = self.audit_failed() {
+            return r;
+        }
+        let list: Vec<ListItem> = {
+            let v = self.vault.read().unwrap_or_else(|e| e.into_inner());
+            v.secrets
                 .iter()
                 .map(|(name, s)| ListItem {
                     name: name.clone(),
@@ -191,153 +735,235 @@ impl Server {
                     tags: s.tags.clone(),
                     updated: s.updated.clone(),
                 })
-                .collect(),
+                .collect()
+        };
+        let mut e = self.entry(req, peer, at);
+        e.decision = "allow";
+        e.result = "ok";
+        if let Err(err) = self.append(e) {
+            return Response::fail(E_AUDIT, format!("audit log write failed: {err}"));
+        }
+        Response {
+            ok: true,
+            list,
             ..Default::default()
         }
     }
 
-    fn read(&self, req: &Request, peer: PeerCred, allowed: bool) -> Response {
-        let at = self.attributor.attribute(peer.pid);
+    fn read(&self, req: &Request, peer: PeerCred, at: &Attribution) -> Response {
+        if let Some(r) = self.audit_failed() {
+            return r;
+        }
         let reason = req.reason.trim();
-        let (decision, values, missing) = {
-            let v = self.vault.read().unwrap();
-            let found: Vec<(&String, &Secret)> = req
+        let thread = at.thread(&self.cfg.context_vars).map(str::to_string);
+        // Metadata only; the lock is not held while policies (or the model) run.
+        let (metas, missing): (Vec<Meta>, Vec<String>) = {
+            let v = self.vault.read().unwrap_or_else(|e| e.into_inner());
+            let metas = req
                 .names
                 .iter()
-                .filter_map(|n| v.secrets.get(n).map(|s| (n, s)))
-                .collect();
-            let decision = if !allowed {
-                Decision::Deny(format!("uid {} may not use this daemon", peer.uid))
-            } else if reason.is_empty() {
-                Decision::Deny("a reason is required".into())
-            } else {
-                self.policy.decide(&PolicyInput {
-                    op: req.op,
-                    secrets: found
-                        .iter()
-                        .map(|(n, s)| SecretMeta {
-                            name: n,
-                            desc: s.desc.as_deref(),
-                            tags: &s.tags,
-                        })
-                        .collect(),
-                    caller: Caller {
-                        peer,
-                        attribution: &at,
-                    },
-                    reason,
+                .filter_map(|n| {
+                    v.secrets
+                        .get(n)
+                        .map(|s| (n.clone(), s.desc.clone(), s.tags.clone()))
                 })
-            };
-            let values: Vec<String> = found.iter().map(|(_, s)| s.value.clone()).collect();
-            let missing: Vec<String> = req
+                .collect();
+            let missing = req
                 .names
                 .iter()
                 .filter(|n| !v.secrets.contains_key(*n))
                 .cloned()
                 .collect();
-            (decision, values, missing)
+            (metas, missing)
         };
-        let (result, resp) = match &decision {
-            Decision::Deny(why) => ("denied", Response::fail(E_DENIED, why.clone())),
-            Decision::Allow if !missing.is_empty() => (
-                "not_found",
+        let input = PolicyInput {
+            op: req.op,
+            secrets: metas
+                .iter()
+                .map(|(n, d, t)| SecretMeta {
+                    name: n,
+                    desc: d.as_deref(),
+                    tags: t,
+                })
+                .collect(),
+            caller: policy::Caller {
+                peer,
+                attribution: at,
+                thread: thread.as_deref(),
+            },
+            reason,
+        };
+        let verdict = self.decide(&input, at, &metas, missing.is_empty());
+        let mut e = self.entry(req, peer, at);
+        e.policy = verdict.policy;
+        e.admission = verdict.admission.clone();
+        let mut resp = match &verdict.decision {
+            Decision::Deny(why) => {
+                e.decision = "deny";
+                e.result = "denied";
+                e.why = Some(why.clone());
+                Response::fail(E_DENIED, why.clone())
+            }
+            _ if !missing.is_empty() => {
+                e.decision = "allow";
+                e.result = "not_found";
                 Response::fail(
                     E_NOT_FOUND,
                     format!("no secret named {}", missing.join(", ")),
-                ),
-            ),
-            _ => (
-                "ok",
-                Response {
-                    ok: true,
-                    values,
-                    ..Default::default()
-                },
-            ),
-        };
-        let outcome = Outcome {
-            decision,
-            result,
-            policy: self.policy.name(),
-        };
-        if let Err(e) = self.record(req, peer, &at, outcome) {
-            return Response::fail(
-                E_INTERNAL,
-                format!("audit log write failed, refusing to release secrets: {e}"),
-            );
-        }
-        resp
-    }
-
-    fn write(&self, req: Request, peer: PeerCred, allowed: bool) -> Response {
-        let at = self.attributor.attribute(peer.pid);
-        let deny = |why: String| Outcome {
-            decision: Decision::Deny(why),
-            result: "denied",
-            policy: "writes",
-        };
-        let (outcome, resp) = if !allowed {
-            let why = format!("uid {} may not use this daemon", peer.uid);
-            (deny(why.clone()), Response::fail(E_DENIED, why))
-        } else {
-            match self.apply_write(&req) {
-                Ok(true) => (
-                    Outcome {
-                        decision: Decision::Allow,
-                        result: "ok",
-                        policy: "writes",
-                    },
-                    Response {
-                        ok: true,
-                        ..Default::default()
-                    },
-                ),
-                Ok(false) => (
-                    Outcome {
-                        decision: Decision::Allow,
-                        result: "not_found",
-                        policy: "writes",
-                    },
-                    Response::fail(E_NOT_FOUND, format!("no secret named {}", req.names[0])),
-                ),
-                Err(e) => (
-                    Outcome {
-                        decision: Decision::Allow,
-                        result: "error",
-                        policy: "writes",
-                    },
-                    Response::fail(E_INTERNAL, e.0),
-                ),
+                )
+            }
+            _ => {
+                e.decision = "allow";
+                let v = self.vault.read().unwrap_or_else(|e| e.into_inner());
+                let values: Option<Vec<SecretValue>> = req
+                    .names
+                    .iter()
+                    .map(|n| v.secrets.get(n).map(|s| SecretValue(s.value.clone())))
+                    .collect();
+                drop(v);
+                match values {
+                    None => {
+                        e.result = "not_found";
+                        Response::fail(
+                            E_NOT_FOUND,
+                            "a secret was removed while the request was decided",
+                        )
+                    }
+                    Some(values)
+                        if values.iter().map(|x| x.0.len() + 16).sum::<usize>()
+                            > proto::MAX_RESPONSE - 4096 =>
+                    {
+                        e.result = "error";
+                        e.why = Some("response too large".into());
+                        Response::fail(
+                            E_BAD_REQUEST,
+                            "the requested values are too large for one response; ask for fewer",
+                        )
+                    }
+                    Some(values) => {
+                        e.result = "ok";
+                        Response {
+                            ok: true,
+                            values,
+                            ..Default::default()
+                        }
+                    }
+                }
             }
         };
-        if let Err(e) = self.record(&req, peer, &at, outcome) {
+        resp.reasoning = verdict.reasoning;
+        if let Err(err) = self.append(e) {
             return Response::fail(
-                E_INTERNAL,
-                format!("change applied but audit write failed: {e}"),
+                E_AUDIT,
+                format!("audit log write failed, refusing to release secrets: {err}"),
             );
         }
         resp
     }
 
-    /// Applies set/rm to a copy of the vault, saves it, then swaps it in.
-    /// Returns false when `rm` names a missing secret.
-    fn apply_write(&self, req: &Request) -> Result<bool> {
+    fn decide(
+        &self,
+        input: &PolicyInput,
+        at: &Attribution,
+        metas: &[Meta],
+        all_found: bool,
+    ) -> Verdict {
+        let deny = |policy, why: String| Verdict {
+            decision: Decision::Deny(why),
+            policy,
+            reasoning: None,
+            admission: None,
+        };
+        if at.is_unavailable() && self.cfg.require_attribution {
+            return deny(
+                "require-attribution",
+                format!(
+                    "the caller could not be attributed ({}); denied because require_attribution = true",
+                    at.error.as_deref().unwrap_or("unknown reason")
+                ),
+            );
+        }
+        let base = self.base.verdict(input);
+        if base.decision != Decision::Allow || !all_found {
+            return base;
+        }
+        let tags: Vec<&[String]> = metas.iter().map(|m| m.2.as_slice()).collect();
+        #[cfg(feature = "net")]
+        let required = crate::admission::required(&tags, self.admission.is_some());
+        #[cfg(not(feature = "net"))]
+        let required = tags
+            .iter()
+            .any(|t| t.iter().any(|x| x == "admission/always"));
+        if !required {
+            return base;
+        }
+        match &self.admission {
+            Some(a) => a.verdict(input),
+            None => deny(
+                "admission",
+                "a requested secret is tagged admission/always, but [admission] is not enabled"
+                    .into(),
+            ),
+        }
+    }
+
+    fn write(
+        &self,
+        req: &Request,
+        peer: PeerCred,
+        at: &Attribution,
+        admin_socket: bool,
+    ) -> Response {
+        if let Some(r) = self.audit_failed() {
+            return r;
+        }
+        let mut e = self.entry(req, peer, at);
+        e.policy = "admin";
+        let refuse = |mut e: Entry, why: String| -> Response {
+            e.decision = "deny";
+            e.result = "denied";
+            e.why = Some(why.clone());
+            match self.append(e) {
+                Ok(_) => Response::fail(E_DENIED, why),
+                Err(err) => Response::fail(E_AUDIT, format!("audit log write failed: {err}")),
+            }
+        };
+        if !self.cfg.admin_uids.contains(&peer.uid) {
+            return refuse(
+                e,
+                format!(
+                    "uid {} may not change secrets (not in admin_uids)",
+                    peer.uid
+                ),
+            );
+        }
+        if self.cfg.admin_socket.is_some() && !admin_socket {
+            return refuse(e, "changes are only accepted on the admin socket".into());
+        }
+        if self.cfg.require_write_reason && req.reason.trim().is_empty() {
+            return refuse(
+                e,
+                "a reason is required for set and rm (require_write_reason = true)".into(),
+            );
+        }
+        let _serial = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let name = &req.names[0];
-        let mut v = self.vault.write().unwrap();
-        let mut next = v.clone();
+        let mut next = self.vault.read().unwrap_or_else(|e| e.into_inner()).clone();
         let now = util::rfc3339_ms(util::now_ms());
         if req.op == Op::Rm {
             if next.secrets.remove(name).is_none() {
-                return Ok(false);
+                e.decision = "allow";
+                e.result = "not_found";
+                return match self.append(e) {
+                    Ok(_) => Response::fail(E_NOT_FOUND, format!("no secret named {name}")),
+                    Err(err) => Response::fail(E_AUDIT, format!("audit log write failed: {err}")),
+                };
             }
         } else {
-            let value = req.value.clone().unwrap_or_default();
-            let created = next
-                .secrets
-                .get(name)
+            let old = next.secrets.get(name);
+            let created = old
                 .map(|s| s.created.clone())
                 .unwrap_or_else(|| now.clone());
-            let old = next.secrets.get(name);
             let desc = req
                 .desc
                 .clone()
@@ -347,6 +973,7 @@ impl Server {
             } else {
                 req.tags.clone()
             };
+            let value = req.value.as_ref().map(|v| v.0.clone()).unwrap_or_default();
             next.secrets.insert(
                 name.clone(),
                 Secret {
@@ -358,50 +985,153 @@ impl Server {
                 },
             );
         }
-        next.save(&self.cfg.vault, &self.key)?;
-        *v = next;
-        Ok(true)
+        next.generation += 1;
+        let bytes = match next.encrypt(&self.key) {
+            Ok(b) => b,
+            Err(err) => return Response::fail(E_INTERNAL, err.0),
+        };
+        let txn = util::random_hex::<8>().unwrap_or_else(|_| format!("{:x}", util::now_ms()));
+        e.decision = "allow";
+        e.result = "ok";
+        e.txn = Some(txn.clone());
+        e.vault_gen = Some(next.generation);
+        e.vault_hash = Some(util::sha256_hex(&bytes));
+        // 1. Audit first.
+        if let Err(err) = self.append(e) {
+            return Response::fail(
+                E_AUDIT,
+                format!("audit log write failed; nothing changed: {err}"),
+            );
+        }
+        // 2. Persist.
+        if let Err(err) = self.vault_dir.write_atomic(&self.vault_name, &bytes, 0o600) {
+            let mut abort = Entry::new("abort", &self.host);
+            abort.txn = Some(txn);
+            abort.why = Some(err.0.clone());
+            let logged = self.append(abort);
+            return Response::fail(
+                E_INTERNAL,
+                format!(
+                    "could not save the vault ({err}); the change was rolled back{}",
+                    if logged.is_err() {
+                        " (and the audit log failed too)"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+        }
+        // 3. Publish.
+        *self.vault.write().unwrap_or_else(|e| e.into_inner()) = next;
+        Response {
+            ok: true,
+            ..Default::default()
+        }
     }
 
-    fn record(&self, req: &Request, peer: PeerCred, at: &Attribution, o: Outcome) -> Result<u64> {
-        let (decision, why) = match o.decision {
-            Decision::Allow => ("allow", None),
-            Decision::Deny(w) => ("deny", Some(w)),
+    fn status(&self) -> Response {
+        let head = self.shared.head();
+        let sinks: Vec<serde_json::Value> = self
+            .sinks
+            .iter()
+            .map(|s| {
+                let s = s.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let mut v = serde_json::to_value(&s).unwrap_or_default();
+                v["lag"] = head.seq.saturating_sub(s.delivered_seq).into();
+                v
+            })
+            .collect();
+        let (gen_, count) = {
+            let v = self.vault.read().unwrap_or_else(|e| e.into_inner());
+            (v.generation, v.secrets.len())
         };
-        let entry = Entry {
-            ts: util::rfc3339_ms(util::now_ms()),
-            seq: 0,
-            op: req.op.as_str(),
-            names: req.names.clone(),
-            reason: req.reason.trim().to_string(),
-            decision,
-            why,
-            result: o.result,
-            policy: o.policy,
-            host: self.host.clone(),
-            peer,
-            cwd: at.cwd.clone(),
-            attribution: at.status,
-            context: at.context.clone(),
-            chain: at.chain.clone(),
-            prev: String::new(),
+        let status = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
+            "uid": util::geteuid(),
+            "started": self.started,
+            "socket": self.cfg.socket,
+            "secrets": count,
+            "vault_generation": gen_,
+            "audit": {
+                "path": self.cfg.audit_log,
+                "head": format!("{}:{}", head.seq, head.mac),
+                "seq": head.seq,
+                "mac": head.mac,
+                "log_id": head.log_id,
+                "failed": self.shared.failed(),
+                "fsync": if self.cfg.audit_fsync == FsyncMode::Strict { "strict" } else { "async" },
+            },
+            "sinks": sinks,
+            "admission": self.cfg.admission.as_ref().map(|a| serde_json::json!({
+                "provider": format!("{:?}", a.provider).to_lowercase(),
+                "model": a.model,
+                "on_error": if a.on_error_allow { "allow" } else { "deny" },
+            })),
+            "rejected_connections": self.rejected_total.load(Ordering::Relaxed),
+            "inflight": self.inflight.load(Ordering::Relaxed),
+        });
+        Response {
+            ok: true,
+            status: Some(status),
+            ..Default::default()
+        }
+    }
+
+    fn verify(&self, req: &Request, peer: PeerCred) -> Response {
+        if !self.cfg.admin_uids.contains(&peer.uid) {
+            return Response::fail(
+                E_DENIED,
+                "only admin_uids may run verify through the daemon",
+            );
+        }
+        let expect = match req
+            .expect_head
+            .as_deref()
+            .map(audit::parse_head)
+            .transpose()
+        {
+            Ok(e) => e,
+            Err(e) => return Response::fail(E_BAD_REQUEST, e.0),
         };
-        self.audit.lock().unwrap().append(entry)
+        let len = self.audit.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let r = util::open_nofollow(&self.cfg.audit_log)
+            .map_err(util::Error::from)
+            .and_then(|f| {
+                audit::verify_reader(
+                    f.take(len),
+                    Some(&vault::chain_key(&self.key)),
+                    expect.as_ref().map(|(s, h)| (*s, h.as_str())),
+                )
+            });
+        match r {
+            Ok(v) => Response {
+                ok: true,
+                status: Some(serde_json::json!({
+                    "entries": v.entries,
+                    "head": format!("{}:{}", v.head.seq, v.head.mac),
+                    "log_id": v.head.log_id,
+                })),
+                ..Default::default()
+            },
+            Err(e) => Response::fail(E_VERIFY, e.0),
+        }
     }
 }
 
 fn validate(req: &Request) -> Option<String> {
-    if req.op != Op::Ls && req.names.is_empty() {
+    let needs_names = req.op.is_read() || req.op.is_write();
+    if needs_names && req.names.is_empty() {
         return Some("no secret name given".into());
     }
-    if matches!(req.op, Op::Set | Op::Rm) && req.names.len() != 1 {
+    if req.op.is_write() && req.names.len() != 1 {
         return Some("set and rm take exactly one name".into());
     }
     if req.names.len() > MAX_NAMES {
         return Some(format!("at most {MAX_NAMES} names per request"));
     }
     if let Some(n) = req.names.iter().find(|n| !valid_name(n)) {
-        let shown: String = n.chars().take(64).collect();
+        let shown = util::escape(&util::cap(n, 64)).into_owned();
         return Some(format!(
             "invalid secret name `{shown}` (use A-Z a-z 0-9 _ . - /, max 128)"
         ));
@@ -410,14 +1140,21 @@ fn validate(req: &Request) -> Option<String> {
         return Some(format!("reason is longer than {MAX_REASON} characters"));
     }
     if req.op == Op::Set {
-        if req.value.as_deref().unwrap_or("").is_empty() {
+        let v = req.value.as_ref().map(|v| v.0.as_str()).unwrap_or("");
+        if v.is_empty() {
             return Some("set needs a non-empty value".into());
+        }
+        if v.len() > proto::MAX_VALUE {
+            return Some(format!("values are limited to {} bytes", proto::MAX_VALUE));
         }
         if req.desc.as_deref().unwrap_or("").chars().count() > MAX_DESC {
             return Some(format!("description is longer than {MAX_DESC} characters"));
         }
+        if req.tags.len() > MAX_TAGS {
+            return Some(format!("at most {MAX_TAGS} tags"));
+        }
         if let Some(t) = req.tags.iter().find(|t| !valid_name(t)) {
-            let shown: String = t.chars().take(64).collect();
+            let shown = util::escape(&util::cap(t, 64)).into_owned();
             return Some(format!("invalid tag `{shown}`"));
         }
     }
