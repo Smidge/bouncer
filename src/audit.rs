@@ -8,12 +8,16 @@
 //! a valid shorter chain; anchor the head (`bouncer status`, a sink) to detect that.
 //!
 //! Failure is latched: if a write or fsync fails, the log is truncated back to its last
-//! complete entry, a `<log>.failed` marker is written, and every later append fails until
-//! `bouncer repair` has been run and the daemon restarted.
+//! complete entry and the failure is recorded in `<log>.state` before anything is reported.
+//! That file is created at its full size when the log is opened, and a failure only
+//! overwrites its first bytes in place and fsyncs, so recording a failure does not need a
+//! new file or new space when the disk is full. Every later append fails, and the daemon
+//! refuses to start, until `bouncer repair` has reset the state.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -37,6 +41,12 @@ pub const GENESIS: &str = "00000000000000000000000000000000000000000000000000000
 
 /// `,"mac":"` + 64 hex + `"}`
 const MAC_SUFFIX_LEN: usize = 8 + 64 + 2;
+
+/// Size of `<log>.state`. It is written in full when created, so recording a failure later
+/// only overwrites bytes that are already allocated.
+const STATE_LEN: usize = 4096;
+const STATE_OK: &[u8] = b"bouncer audit state 1: ok\n";
+const STATE_FAILED: &[u8] = b"bouncer audit state 1: FAILED\n";
 
 fn is_zero(n: &u64) -> bool {
     *n == 0
@@ -110,21 +120,23 @@ impl Entry {
         }
     }
 
-    fn shrink(&mut self) {
+    /// Cuts optional attribution detail so the entry fits `MAX_ENTRY`: step 1 shortens the
+    /// process chain and context values, step 2 drops the chain and working directory.
+    /// Names, the reason, the decision and the admission record are never cut; an entry
+    /// that is still too large is refused, and with it the request.
+    fn shrink(&mut self, step: u8) {
         self.truncated = true;
-        self.reason = util::cap(&self.reason, 200);
-        self.why = self.why.as_deref().map(|w| util::cap(w, 200));
-        if let Some(a) = &mut self.admission {
-            a.reasoning = util::cap(&a.reasoning, 500);
-        }
         if let Some(a) = &mut self.attribution {
             a.shrink();
             a.cwd = a.cwd.as_deref().map(|c| util::cap(c, 100));
             for c in a.context.values_mut() {
                 c.value = util::cap(&c.value, 64);
             }
+            if step >= 2 {
+                a.chain.clear();
+                a.cwd = None;
+            }
         }
-        self.names.truncate(8);
     }
 }
 
@@ -156,11 +168,98 @@ impl Notify {
     }
 }
 
+/// `<log>.state`: whether the log has failed, kept in a file that is never resized.
+struct StateFile {
+    file: File,
+}
+
+impl StateFile {
+    fn body(failed: Option<&str>) -> Vec<u8> {
+        let mut b = match failed {
+            None => STATE_OK.to_vec(),
+            Some(why) => {
+                let mut b = STATE_FAILED.to_vec();
+                b.extend_from_slice(util::escape(&util::cap(why, 1000)).as_bytes());
+                b.push(b'\n');
+                b
+            }
+        };
+        b.truncate(STATE_LEN - 1);
+        b.resize(STATE_LEN - 1, b' ');
+        b.push(b'\n');
+        b
+    }
+
+    /// Overwrites the state in place and fsyncs it.
+    fn set(&self, failed: Option<&str>) -> std::io::Result<()> {
+        self.file.write_all_at(&Self::body(failed), 0)?;
+        self.file.sync_data()
+    }
+
+    /// None if the state is ok, else why it is not. Anything unexpected counts as failed.
+    fn read(&self) -> std::io::Result<Option<String>> {
+        let mut buf = vec![0u8; STATE_LEN + 1];
+        let mut n = 0;
+        while n < buf.len() {
+            match self.file.read_at(&mut buf[n..], n as u64)? {
+                0 => break,
+                k => n += k,
+            }
+        }
+        if n != STATE_LEN {
+            return Ok(Some(format!(
+                "the state file has {n} bytes, not {STATE_LEN}"
+            )));
+        }
+        if buf.starts_with(STATE_OK) {
+            return Ok(None);
+        }
+        if let Some(rest) = buf[..n].strip_prefix(STATE_FAILED) {
+            let why = rest.split(|&b| b == b'\n').next().unwrap_or_default();
+            return Ok(Some(String::from_utf8_lossy(why).trim().to_string()));
+        }
+        Ok(Some("the state file is not recognised".into()))
+    }
+
+    /// Opens `<log>.state`, creating it (at full size, fsynced) if it does not exist.
+    /// Returns the file and whether it was created.
+    fn open(dir: &Dir, log_name: &OsStr) -> Result<(StateFile, bool)> {
+        let name = state_name(log_name);
+        let path = dir.path().join(&name);
+        let created = dir.lstat(&name)?.is_none();
+        let flags = libc::O_RDWR
+            | if created {
+                libc::O_CREAT | libc::O_EXCL
+            } else {
+                0
+            };
+        let file = ctx(dir.open_at(&name, flags, 0o600), "cannot open", &path)?;
+        util::check_data_file(&ctx(file.metadata(), "cannot stat", &path)?, &path)?;
+        let st = StateFile { file };
+        if created {
+            ctx(st.set(None), "cannot write", &path)?;
+        }
+        Ok((st, created))
+    }
+}
+
+fn state_name(log_name: &OsStr) -> OsString {
+    let mut m = log_name.to_os_string();
+    m.push(".state");
+    m
+}
+
 /// State shared with the fsync thread, the sinks and `status`.
 #[derive(Default)]
 pub struct Shared {
     failed_flag: AtomicBool,
     failed: Mutex<Option<String>>,
+    /// Where the failed state is persisted; None only in tests that build `Shared` alone.
+    state: Mutex<Option<StateFile>>,
+    /// The failed state is on disk.
+    persisted: AtomicBool,
+    #[cfg(test)]
+    fail_fsync: AtomicBool,
     /// Bytes written to the log.
     pub written: AtomicU64,
     /// Bytes known to be on disk. Sinks never read past this.
@@ -190,13 +289,35 @@ impl Shared {
             .clone()
     }
 
-    fn latch(&self, why: String) {
+    /// Enters the failed state: first in memory (nothing more is appended or released), then
+    /// on disk. The reason is only readable (`failed`, so in any answer or `status`) once it
+    /// is on disk, because the lock is held while it is written. Returns an error if it could
+    /// not be persisted; the daemon then stays failed in memory and the next latch retries.
+    pub fn latch(&self, why: String) -> std::result::Result<(), String> {
         let mut f = self.failed.lock().unwrap_or_else(|e| e.into_inner());
-        if f.is_none() {
-            eprintln!("bouncer: AUDIT LOG FAILED, refusing all requests until repaired: {why}");
-            *f = Some(why);
-        }
         self.failed_flag.store(true, Ordering::Release);
+        let why = f.get_or_insert(why).clone();
+        if self.persisted.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let r = match &*self.state.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(st) => st.set(Some(&why)).map_err(|e| e.to_string()),
+            None => Ok(()),
+        };
+        match &r {
+            Ok(()) => {
+                self.persisted.store(true, Ordering::Release);
+                eprintln!(
+                    "bouncer: AUDIT LOG FAILED, refusing all requests until `bouncer repair`: {why}"
+                );
+            }
+            Err(e) => eprintln!(
+                "bouncer: AUDIT LOG FAILED, refusing all requests: {why}. The failure could not be \
+                 recorded on disk ({e}); do not restart the daemon before running `bouncer repair`"
+            ),
+        }
+        drop(f);
+        r
     }
 
     pub fn head(&self) -> Head {
@@ -438,10 +559,22 @@ impl AuditLog {
     ) -> Result<(AuditLog, Verified)> {
         let (dir, name) = util::split_path(path)?;
         let dir = Dir::secure(&dir, true)?;
+        // Written by bouncer before the state file existed.
         if dir.lstat(&marker_name(name))?.is_some() {
             return Err(err!(
                 "an earlier audit log write failed ({} exists); fix the cause, run `bouncer repair`, then start again",
                 dir.path().join(marker_name(name)).display()
+            ));
+        }
+        let (state, state_created) = StateFile::open(&dir, name)?;
+        if let Some(why) = ctx(
+            state.read(),
+            "cannot read",
+            &dir.path().join(state_name(name)),
+        )? {
+            return Err(err!(
+                "the audit log is in a failed state ({why}; recorded in {}). Fix the cause, run `bouncer repair`, then start again",
+                dir.path().join(state_name(name)).display()
             ));
         }
         let created = dir.lstat(name)?.is_none();
@@ -451,7 +584,7 @@ impl AuditLog {
             path,
         )?;
         util::check_data_file(&ctx(file.metadata(), "cannot stat", path)?, path)?;
-        if created {
+        if created || state_created {
             ctx(dir.sync(), "cannot sync", dir.path())?;
         }
         let verified = verify_reader(&file, Some(&chain_key), None)?;
@@ -460,6 +593,7 @@ impl AuditLog {
             head.log_id = util::random_hex::<16>()?;
         }
         let shared = Arc::new(Shared::default());
+        *shared.state.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
         shared.written.store(verified.len, Ordering::Release);
         shared.durable.store(verified.len, Ordering::Release);
         *shared.head.lock().unwrap() = head.clone();
@@ -504,27 +638,31 @@ impl AuditLog {
         self.dir.path().join(&self.name)
     }
 
-    fn fail(&mut self, why: String) -> util::Error {
+    fn fail(&mut self, mut why: String) -> util::Error {
         // Cut back to the last complete entry so the log stays verifiable.
-        let _ = self.file.set_len(self.len);
-        let _ = self.dir.write_atomic(
-            &marker_name(&self.name),
-            format!("{why}\n").as_bytes(),
-            0o600,
-        );
-        self.shared.latch(why.clone());
-        err!("audit log write failed: {why}")
+        if let Err(e) = self.file.set_len(self.len) {
+            why.push_str(&format!("; truncating the partial entry also failed: {e}"));
+        }
+        match self.shared.latch(why.clone()) {
+            Ok(()) => err!("audit log write failed: {why}"),
+            Err(e) => err!("audit log write failed: {why} (and recording the failure failed: {e})"),
+        }
     }
 
     /// Encodes the entry with its MAC, shrinking it if it is too large.
     fn encode(&self, e: &mut Entry) -> Result<(Vec<u8>, String)> {
         let mut s = serde_json::to_vec(&*e).map_err(|_| err!("cannot encode audit entry"))?;
-        if s.len() + MAC_SUFFIX_LEN + 1 > MAX_ENTRY {
-            e.shrink();
-            s = serde_json::to_vec(&*e).map_err(|_| err!("cannot encode audit entry"))?;
-            if s.len() + MAC_SUFFIX_LEN + 1 > MAX_ENTRY {
-                return Err(err!("audit entry is larger than {MAX_ENTRY} bytes"));
+        for step in 1..=2 {
+            if s.len() + MAC_SUFFIX_LEN < MAX_ENTRY {
+                break;
             }
+            e.shrink(step);
+            s = serde_json::to_vec(&*e).map_err(|_| err!("cannot encode audit entry"))?;
+        }
+        if s.len() + MAC_SUFFIX_LEN >= MAX_ENTRY {
+            return Err(err!(
+                "the audit entry would be larger than {MAX_ENTRY} bytes even without process details; refused"
+            ));
         }
         let mac = mac_hex(&self.chain_key, &s);
         s.pop(); // the closing brace
@@ -588,7 +726,14 @@ fn fsync_loop(f: File, sh: Arc<Shared>) {
         seen = sh.appended.wait(seen, Duration::from_secs(3600));
         let target = sh.written.load(Ordering::Acquire);
         if target > sh.durable.load(Ordering::Acquire) {
-            match f.sync_data() {
+            let r = f.sync_data();
+            #[cfg(test)]
+            let r = if sh.fail_fsync.load(Ordering::Acquire) {
+                Err(std::io::Error::other("injected fsync failure"))
+            } else {
+                r
+            };
+            match r {
                 Ok(()) => {
                     sh.durable.fetch_max(target, Ordering::AcqRel);
                     sh.synced.bump();
@@ -596,7 +741,7 @@ fn fsync_loop(f: File, sh: Arc<Shared>) {
                 Err(e) => {
                     // The kernel may have dropped the dirty pages; nothing written since the
                     // last good fsync can be trusted to be on disk.
-                    sh.latch(format!("background fsync failed: {e}"));
+                    let _ = sh.latch(format!("background fsync failed: {e}"));
                     return;
                 }
             }
@@ -608,8 +753,8 @@ fn fsync_loop(f: File, sh: Arc<Shared>) {
     }
 }
 
-/// Offline repair: cuts an incomplete last line, verifies the rest and removes the failure
-/// marker. Returns the verification result.
+/// Offline repair: cuts an incomplete last line, verifies the rest and resets the failed
+/// state (and removes the marker older versions wrote). Returns the verification result.
 pub fn repair(path: &Path, key: Option<&[u8; 32]>) -> Result<Verified> {
     let (dir, name) = util::split_path(path)?;
     let dir = Dir::secure(&dir, true)?;
@@ -643,11 +788,23 @@ pub fn repair(path: &Path, key: Option<&[u8; 32]>) -> Result<Verified> {
     let mut f = f;
     std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(0))?;
     let v = verify_reader(&f, key, None)?;
+    let (state, _) = StateFile::open(&dir, name)?;
+    ctx(
+        state.file.set_len(STATE_LEN as u64),
+        "cannot resize",
+        &dir.path().join(state_name(name)),
+    )?;
+    ctx(
+        state.set(None),
+        "cannot write",
+        &dir.path().join(state_name(name)),
+    )?;
     match dir.unlink(&marker_name(name)) {
-        Ok(()) => dir.sync()?,
+        Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
+    dir.sync()?;
     Ok(v)
 }
 
@@ -789,6 +946,139 @@ mod tests {
     }
 
     #[test]
+    fn failed_state_survives_restart_without_new_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp("latch");
+        let dir = path.parent().unwrap().to_path_buf();
+        let (mut log, _) = AuditLog::open(&path, key(), true).unwrap();
+        log.append(entry()).unwrap();
+        let state = dir.join("audit.jsonl.state");
+        assert_eq!(fs::metadata(&state).unwrap().len(), STATE_LEN as u64);
+        // No new file can be created in the directory (as when the disk is full): the
+        // failure is still recorded, in the preallocated state file.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        log.fail_after = Some(20);
+        let e = log.append(entry()).unwrap_err().to_string();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!e.contains("recording the failure failed"), "{e}");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2, "no new files");
+        let text = fs::read_to_string(&state).unwrap();
+        assert!(
+            text.starts_with("bouncer audit state 1: FAILED\nwrite: injected"),
+            "{text}"
+        );
+        assert_eq!(text.len(), STATE_LEN);
+        drop(log);
+        // A restart refuses to serve...
+        let e = AuditLog::open(&path, key(), true)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains("failed state") && e.contains("bouncer repair"),
+            "{e}"
+        );
+        // ...also when the state file was damaged rather than flipped.
+        fs::write(&state, "ok").unwrap();
+        assert!(AuditLog::open(&path, key(), true).is_err());
+        // Repair resets it.
+        repair(&path, Some(&key())).unwrap();
+        assert_eq!(fs::metadata(&state).unwrap().len(), STATE_LEN as u64);
+        let (mut log, _) = AuditLog::open(&path, key(), true).unwrap();
+        assert_eq!(log.append(entry()).unwrap().seq, 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn background_fsync_failure_is_persisted() {
+        let path = tmp("bgsync");
+        let (mut log, _) = AuditLog::open(&path, key(), false).unwrap();
+        log.shared.fail_fsync.store(true, Ordering::Release);
+        log.append(entry()).unwrap();
+        let t = std::time::Instant::now();
+        while log.shared.failed().is_none() {
+            assert!(
+                t.elapsed() < Duration::from_secs(10),
+                "fsync thread did not latch"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(log.shared.persisted.load(Ordering::Acquire));
+        assert!(log.append(entry()).is_err());
+        drop(log);
+        let e = AuditLog::open(&path, key(), false)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains("background fsync failed"), "{e}");
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// The largest request the daemon accepts always fits in one entry with every name and
+    /// the whole reason, however much attribution detail there is.
+    #[test]
+    fn worst_case_request_keeps_every_name() {
+        use crate::peer::{ChainEntry, CtxOther, CtxValue};
+        use crate::proto::{MAX_NAMES, MAX_REASON};
+        let path = tmp("worst");
+        let (mut log, _) = AuditLog::open(&path, key(), true).unwrap();
+        // Control characters take 6 bytes each in JSON (\u0001).
+        let ctl = |n: usize| "\u{1}".repeat(n);
+        let mut e = entry();
+        e.names = (0..MAX_NAMES)
+            .map(|i| format!("{i:03}{}", "N".repeat(125)))
+            .collect();
+        e.reason = ctl(MAX_REASON);
+        e.why = Some(format!("admission check denied the request: {}", ctl(1000)));
+        e.admission = Some(AdmissionRecord {
+            decision: "deny".into(),
+            reasoning: ctl(1000),
+            model: "m".into(),
+            cached: false,
+            error: Some(ctl(300)),
+        });
+        let mut at = Attribution {
+            cwd: Some(ctl(512)),
+            ..Default::default()
+        };
+        for i in 0..64 {
+            at.chain.push(ChainEntry {
+                pid: i,
+                uid: Some(1),
+                exe: Some(ctl(256)),
+                argv: Some(ctl(700)),
+                env: true,
+            });
+        }
+        for v in 0..16 {
+            at.context.insert(
+                format!("CONTEXT_VARIABLE_NUMBER_{v}"),
+                CtxValue {
+                    value: ctl(256),
+                    pid: 1,
+                    other: (0..7)
+                        .map(|p| CtxOther {
+                            value: ctl(256),
+                            pid: p,
+                        })
+                        .collect(),
+                },
+            );
+        }
+        e.attribution = Some(at);
+        let names = e.names.clone();
+        log.append(e).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.len() <= MAX_ENTRY);
+        let v: serde_json::Value = serde_json::from_str(text.trim_end()).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["names"], serde_json::json!(names));
+        assert_eq!(v["reason"].as_str().unwrap().chars().count(), MAX_REASON);
+        verify(&path, Some(&key()), None).unwrap();
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn oversized_entries_shrink_or_fail() {
         let path = tmp("size");
         let (mut log, _) = AuditLog::open(&path, key(), true).unwrap();
@@ -811,7 +1101,9 @@ mod tests {
         verify(&path, Some(&key()), None).unwrap();
         let mut e = entry();
         e.names = vec!["n".repeat(MAX_ENTRY); 1];
-        assert!(log.append(e).is_err());
+        // Names are never cut, so this entry is refused.
+        let err = log.append(e).unwrap_err().to_string();
+        assert!(err.contains("refused"), "{err}");
         assert!(
             log.shared.failed().is_none(),
             "a size error is not an I/O failure"

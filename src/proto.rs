@@ -19,6 +19,15 @@ pub const MAX_SET_FRAME: usize = 2 * 1024 * 1024;
 pub const MAX_VALUE: usize = 256 * 1024;
 /// Largest response line (e.g. `exec` with several values).
 pub const MAX_RESPONSE: usize = 4 * 1024 * 1024;
+/// Secret names per request. With names of at most 128 characters this keeps every
+/// request's audit entry well under `audit::MAX_ENTRY` (see the audit tests).
+pub const MAX_NAMES: usize = 64;
+/// Longest reason, in characters. Longer requests are rejected, not cut.
+pub const MAX_REASON: usize = 1000;
+/// Longest description, in characters. Longer requests are rejected, not cut.
+pub const MAX_DESC: usize = 500;
+/// Tags per secret.
+pub const MAX_TAGS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

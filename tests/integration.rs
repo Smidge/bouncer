@@ -921,6 +921,9 @@ fn audit_failure_fails_closed_until_repaired() {
     let ok = env.run(&["verify-log"], None, &[]);
     assert_eq!(ok.status.code(), Some(0), "{}", stderr(&ok));
     env.stop();
+    // The failure was recorded on disk before it was reported.
+    let state = fs::read_to_string(env.dir.join("audit.jsonl.state")).unwrap();
+    assert!(state.contains("FAILED"), "{state}");
     // Restarting is not enough...
     let e = env.serve_fails(&[]);
     assert!(e.contains("bouncer repair"), "{e}");

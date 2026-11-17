@@ -30,16 +30,12 @@ use crate::peer::{Attribution, Attributor, Caller, PeerCred};
 use crate::policy::{self, Decision, Policy, PolicyInput, SecretMeta, Verdict};
 use crate::proto::{
     self, E_AUDIT, E_BAD_REQUEST, E_BUSY, E_DENIED, E_INTERNAL, E_NOT_FOUND, E_VERIFY, ListItem,
-    Op, Request, Response, SecretValue,
+    MAX_DESC, MAX_NAMES, MAX_REASON, MAX_TAGS, Op, Request, Response, SecretValue,
 };
 use crate::sink::{self, StatusHandle};
 use crate::util::{self, Dir, Result, ctx};
 use crate::vault::{self, Key, Secret, Vault, valid_name};
 
-const MAX_NAMES: usize = 64;
-const MAX_REASON: usize = 1000;
-const MAX_DESC: usize = 500;
-const MAX_TAGS: usize = 16;
 const WORKER_STACK: usize = 512 * 1024;
 const REJECT_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
