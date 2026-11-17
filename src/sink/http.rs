@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use zeroize::Zeroizing;
 
-use super::{Line, Sink};
+use super::{Delivery, Line, Sink};
 use crate::config::HttpConfig;
 use crate::err;
 use crate::util::{self, Result};
@@ -38,7 +38,7 @@ impl Sink for HttpSink {
         format!("http:{}", self.cfg.url)
     }
 
-    fn send(&mut self, batch: &[Line]) -> Result<usize> {
+    fn send(&mut self, batch: &[Line]) -> Result<Delivery> {
         for (i, l) in batch.iter().enumerate() {
             let mut req = self
                 .agent
@@ -64,11 +64,11 @@ impl Sink for HttpSink {
             };
             if i > 0 {
                 eprintln!("bouncer: {err}");
-                return Ok(i);
+                return Ok(Delivery::all(i));
             }
             return Err(err);
         }
-        Ok(batch.len())
+        Ok(Delivery::all(batch.len()))
     }
 }
 
@@ -109,7 +109,7 @@ mod tests {
             entry: &e,
         };
         // The second entry fails: one delivered.
-        assert_eq!(s.send(&[mk(1), mk(2)]).unwrap(), 1);
+        assert_eq!(s.send(&[mk(1), mk(2)]).unwrap(), Delivery::all(1));
         assert!(s.send(&[mk(2)]).is_err());
         let r = seen.lock().unwrap()[0].clone();
         assert_eq!(r.path, "/hook");

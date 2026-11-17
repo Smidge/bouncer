@@ -1093,15 +1093,25 @@ mod http {
 
     #[derive(Debug, Clone)]
     pub struct Req {
+        pub method: String,
         pub path: String,
         pub headers: HashMap<String, String>,
         pub body: Vec<u8>,
     }
 
     type Handler = Arc<dyn Fn(&Req) -> (u16, String) + Send + Sync>;
+    type HeaderHandler = Arc<dyn Fn(&Req) -> (u16, Vec<(String, String)>, String) + Send + Sync>;
 
     /// A minimal HTTP/1.1 server that records requests.
     pub fn serve(handler: Handler) -> (u16, Arc<Mutex<Vec<Req>>>) {
+        serve_with_headers(Arc::new(move |r| {
+            let (s, b) = handler(r);
+            (s, vec![], b)
+        }))
+    }
+
+    /// As `serve`, with response headers; HEAD answers have no body.
+    pub fn serve_with_headers(handler: HeaderHandler) -> (u16, Arc<Mutex<Vec<Req>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1118,6 +1128,7 @@ mod http {
                         if r.read_line(&mut line).unwrap_or(0) == 0 {
                             return;
                         }
+                        let method = line.split_whitespace().next().unwrap_or("").to_string();
                         let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
                         let mut headers = HashMap::new();
                         loop {
@@ -1137,15 +1148,21 @@ mod http {
                         let mut body = vec![0; len];
                         r.read_exact(&mut body).unwrap();
                         let req = Req {
+                            method,
                             path,
                             headers,
                             body,
                         };
-                        let (status, text) = handler(&req);
+                        let (status, extra, mut text) = handler(&req);
+                        let len = text.len();
+                        if req.method == "HEAD" {
+                            text.clear();
+                        }
                         seen.lock().unwrap().push(req);
+                        let extra: String =
+                            extra.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
                         let resp = format!(
-                            "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{text}",
-                            text.len()
+                            "HTTP/1.1 {status} X\r\nContent-Length: {len}\r\n{extra}\r\n{text}"
                         );
                         w.write_all(resp.as_bytes()).unwrap();
                     }
@@ -1175,15 +1192,38 @@ mod http {
 
     #[test]
     fn sinks_upload_resume_and_mirror() {
-        // Like S3 with If-None-Match: an existing key answers 412.
-        let keys = Arc::new(Mutex::new(std::collections::HashSet::new()));
-        let (port, seen) = serve(Arc::new(move |r| {
-            if keys.lock().unwrap().insert(r.path.clone()) {
-                (200, String::new())
-            } else {
-                (412, String::new())
+        // Like S3 with If-None-Match: an existing key answers 412, and HEAD gives its ETag.
+        let objects = Arc::new(Mutex::new(HashMap::new()));
+        let (port, all) = serve_with_headers(Arc::new(move |r| {
+            let mut objects = objects.lock().unwrap();
+            if r.method == "HEAD" {
+                return match objects.get(&r.path) {
+                    Some(tag) => (
+                        200,
+                        vec![("ETag".into(), format!("\"{tag}\""))],
+                        String::new(),
+                    ),
+                    None => (404, vec![], String::new()),
+                };
             }
+            if objects.contains_key(&r.path) {
+                return (412, vec![], String::new());
+            }
+            objects.insert(r.path.clone(), bouncer::sink::s3::etag(&r.body));
+            (200, vec![], String::new())
         }));
+        // The uploads (PUTs) only.
+        let seen = {
+            let all = all.clone();
+            move || -> Vec<Req> {
+                all.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.method == "PUT")
+                    .cloned()
+                    .collect()
+            }
+        };
         let dir = private_dir();
         let ak = secret_file(&dir, "ak", "AKIDEXAMPLE\n");
         let sk = secret_file(&dir, "sk", "fake-s3-secret-for-tests");
@@ -1211,12 +1251,12 @@ path = "{}"
         env.set("A", "fake-a-value");
         assert_eq!(env.get("A").status.code(), Some(0));
         let log_len = |env: &Env| env.log_entries().len();
-        wait_for("uploads", || seen.lock().unwrap().len() >= log_len(&env));
+        wait_for("uploads", || seen().len() >= log_len(&env));
         wait_for("mirror", || {
             fs::read(&mirror).ok() == fs::read(env.log_path()).ok()
         });
 
-        let reqs = seen.lock().unwrap().clone();
+        let reqs = seen();
         let lines: Vec<String> = fs::read_to_string(env.log_path())
             .unwrap()
             .lines()
@@ -1232,6 +1272,7 @@ path = "{}"
                 entry["ts"].as_str().unwrap(),
                 entry["log_id"].as_str().unwrap(),
                 entry["seq"].as_u64().unwrap(),
+                entry["mac"].as_str().unwrap(),
             );
             assert_eq!(
                 r.path,
@@ -1259,7 +1300,8 @@ path = "{}"
         );
 
         // Crash and resume: everything after the saved cursor is sent once more at most, and
-        // an object that already exists is never replaced (412 counts as delivered).
+        // an object that already exists is never replaced (412, then HEAD shows the same
+        // content, counts as delivered).
         let cursor_path = env.dir.join("audit.jsonl.s3.cursor");
         let last_seq = env.log_entries().last().unwrap()["seq"].as_u64().unwrap();
         wait_for("cursor", || {
@@ -1269,24 +1311,30 @@ path = "{}"
                 .is_some_and(|c| c["seq"].as_u64() == Some(last_seq))
         });
         env.stop();
-        let before = seen.lock().unwrap().len();
+        let before = seen().len();
         env.serve(&[]);
         env.get("A");
         let distinct = || {
-            let mut p: Vec<String> = seen
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|r| r.path.clone())
-                .collect();
+            let mut p: Vec<String> = seen().iter().map(|r| r.path.clone()).collect();
             p.sort();
             p.dedup();
             p.len()
         };
         wait_for("resume", || distinct() >= log_len(&env));
-        let total = seen.lock().unwrap().len();
-        assert_eq!(total, distinct(), "an entry was uploaded twice");
-        assert!(seen.lock().unwrap().len() > before);
+        // A re-sent entry got 412 and was only counted after a HEAD of the same key.
+        let reqs = all.lock().unwrap().clone();
+        let mut puts: HashMap<&str, usize> = HashMap::new();
+        for r in reqs.iter().filter(|r| r.method == "PUT") {
+            *puts.entry(&r.path).or_default() += 1;
+        }
+        for (path, n) in puts {
+            let heads = reqs
+                .iter()
+                .filter(|r| r.method == "HEAD" && r.path == path)
+                .count();
+            assert_eq!(heads, n - 1, "{path}");
+        }
+        assert!(seen().len() > before);
         wait_for("mirror after restart", || {
             fs::read(&mirror).ok() == fs::read(env.log_path()).ok()
         });

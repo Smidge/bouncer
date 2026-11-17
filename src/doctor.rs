@@ -252,6 +252,13 @@ pub fn run(cfg: &Config) -> Result<i32> {
         }
         for s in st["sinks"].as_array().into_iter().flatten() {
             let name = s["name"].as_str().unwrap_or("?");
+            if let Some(q) = s["last_quarantined"].as_str() {
+                r.warn(format!(
+                    "sink {name}: {} entr(ies) refused by the destination were skipped (see `sink_reject` in the log); last: {}",
+                    s["quarantined"],
+                    escape(q)
+                ));
+            }
             match s["last_error"].as_str() {
                 Some(e) => r.bad(format!("sink {name}: last error: {}", escape(e))),
                 None if s["lag"].as_u64().unwrap_or(0) > 100 => {

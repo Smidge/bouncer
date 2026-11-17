@@ -938,6 +938,13 @@ fn cmd_status(cfg: &Config, mut args: Args) -> Result<i32> {
                 .map(|e| escape(e).into_owned())
                 .unwrap_or_else(|| "none".into())
         );
+        if let Some(q) = k["last_quarantined"].as_str() {
+            println!(
+                "           {} entr(ies) refused by the destination and skipped; last: {}",
+                k["quarantined"],
+                escape(q)
+            );
+        }
     }
     if st["admission"].is_object() {
         println!(

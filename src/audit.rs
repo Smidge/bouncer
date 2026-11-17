@@ -269,6 +269,8 @@ pub struct Shared {
     /// Bumped when `durable` grows (wakes sinks).
     pub synced: Notify,
     pub head: Mutex<Head>,
+    /// Notes from sink threads, appended to the log as `sink_reject` entries by the daemon.
+    notes: Mutex<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -322,6 +324,18 @@ impl Shared {
 
     pub fn head(&self) -> Head {
         self.head.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Queues a note for the audit log (at most 1000 are kept until written).
+    pub fn note(&self, n: String) {
+        let mut q = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        if q.len() < 1000 {
+            q.push(n);
+        }
+    }
+
+    pub fn take_notes(&self) -> Vec<String> {
+        std::mem::take(&mut *self.notes.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
 

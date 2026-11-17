@@ -643,15 +643,28 @@ fn parse_sink(t: &mut Tbl, kind: &str) -> Result<SinkKind> {
         "file" => SinkKind::File {
             path: t.req("path")?.into(),
         },
-        "influxdb" => SinkKind::Influx(InfluxConfig {
-            endpoint: t.url("endpoint", None, insecure)?,
-            org: t.req("org")?,
-            bucket: t.req("bucket")?,
-            token: t.req_secret("token")?,
-            measurement: t
+        "influxdb" => {
+            let measurement = t
                 .str("measurement")?
-                .unwrap_or_else(|| "bouncer_audit".into()),
-        }),
+                .unwrap_or_else(|| "bouncer_audit".into());
+            // InfluxDB reserves names starting with `_`; control characters cannot be sent.
+            if measurement.is_empty()
+                || measurement.starts_with('_')
+                || measurement.chars().any(char::is_control)
+            {
+                return Err(err!(
+                    "{}: measurement must be non-empty, printable and not start with `_`",
+                    t.what
+                ));
+            }
+            SinkKind::Influx(InfluxConfig {
+                endpoint: t.url("endpoint", None, insecure)?,
+                org: t.req("org")?,
+                bucket: t.req("bucket")?,
+                token: t.req_secret("token")?,
+                measurement,
+            })
+        }
         "http" => SinkKind::Http(HttpConfig {
             url: t.url("url", None, insecure)?,
             hmac_secret: t.secret("hmac_secret")?,
@@ -1126,6 +1139,10 @@ api_key_file = "/etc/bouncer/llm.key"
         assert!(bad("[admission]\nenabled = false\nprovider = \"opneai\"").is_some());
         assert!(bad("[admission]\nendpoint = \"http://x\"").is_some());
         assert!(bad("[admission]\n").is_none());
+        let influx = "[[sink]]\ntype = \"influxdb\"\nendpoint = \"https://i\"\norg = \"o\"\nbucket = \"b\"\ntoken_file = \"/t\"\n";
+        assert!(bad(&format!("{influx}measurement = \"_bad\"")).is_some());
+        assert!(bad(&format!("{influx}measurement = \"\"")).is_some());
+        assert!(bad(&format!("{influx}measurement = \"ok name\"")).is_none());
         let e =
             bad("[[sink]]\ntype = \"file\"\npath = \"/x\"\nallow_insecure_http = true").unwrap();
         assert!(e.contains("allow_insecure_http"), "{e}");

@@ -330,8 +330,9 @@ pub fn serve(mut cfg: Config, opts: Options) -> Result<()> {
             .stack_size(WORKER_STACK)
             .spawn(move || {
                 loop {
-                    std::thread::sleep(REJECT_LOG_INTERVAL);
+                    std::thread::sleep(Duration::from_secs(1));
                     srv.flush_rejects();
+                    srv.flush_notes();
                 }
             })
             .map_err(|e| err!("cannot start housekeeping thread: {e}"))?;
@@ -771,6 +772,15 @@ impl Server {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .append(e);
+    }
+
+    /// Records notes from the sink threads (quarantined entries) in the audit log.
+    fn flush_notes(&self) {
+        for n in self.shared.take_notes() {
+            let mut e = Entry::new("sink_reject", &self.host);
+            e.note = Some(n);
+            let _ = self.append(e);
+        }
     }
 
     fn attribute(&self, caller: &Caller) -> Attribution {
