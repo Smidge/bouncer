@@ -216,17 +216,82 @@ pub fn load_key(src: &KeySource) -> Result<Key> {
             )
         }
         KeySource::Command(argv) => {
-            let out = std::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::inherit())
-                .output()
-                .map_err(|e| err!("cannot run key_command `{}`: {e}", argv[0]))?;
-            let stdout = Zeroizing::new(out.stdout);
-            if !out.status.success() {
-                return Err(err!("key_command `{}` failed ({})", argv[0], out.status));
+            let out = run_key_command(argv, KEY_COMMAND_DEADLINE)?;
+            parse_key(&out, "key_command output")
+        }
+    }
+}
+
+/// How long `key_command` may take.
+const KEY_COMMAND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// The most `key_command` may print (a key is 64 hex characters).
+const KEY_COMMAND_MAX_OUTPUT: u64 = 4096;
+
+/// Runs `key_command` (no shell) in its own process group and returns its stdout. It must
+/// exit successfully within `deadline` and print at most `KEY_COMMAND_MAX_OUTPUT` bytes;
+/// otherwise its whole process group is killed and reaped.
+fn run_key_command(argv: &[String], deadline: std::time::Duration) -> Result<Zeroizing<Vec<u8>>> {
+    use std::os::unix::process::CommandExt;
+    use std::time::Instant;
+    let mut child = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .process_group(0)
+        .spawn()
+        .map_err(|e| err!("cannot run key_command `{}`: {e}", argv[0]))?;
+    let pid = child.id() as libc::pid_t;
+    let kill = |child: &mut std::process::Child| {
+        // SAFETY: kill with a negative pid signals the process group we created.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+        let _ = child.wait();
+    };
+    let mut stdout = child.stdout.take().expect("piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    // A grandchild could keep the pipe open, so the reader is never joined.
+    std::thread::spawn(move || {
+        let mut buf = Zeroizing::new(Vec::new());
+        let r = (&mut stdout)
+            .take(KEY_COMMAND_MAX_OUTPUT + 1)
+            .read_to_end(&mut buf);
+        let _ = tx.send(r.map(|_| buf));
+    });
+    let start = Instant::now();
+    let fail = |child: &mut std::process::Child, why: String| {
+        kill(child);
+        Err(err!("key_command `{}` {why}", argv[0]))
+    };
+    let out = match rx.recv_timeout(deadline) {
+        Ok(Ok(buf)) if buf.len() as u64 > KEY_COMMAND_MAX_OUTPUT => {
+            return fail(
+                &mut child,
+                format!("printed more than {KEY_COMMAND_MAX_OUTPUT} bytes; killed"),
+            );
+        }
+        Ok(Ok(buf)) => buf,
+        Ok(Err(e)) => return fail(&mut child, format!("output could not be read: {e}")),
+        Err(_) => {
+            return fail(
+                &mut child,
+                format!("did not finish within {deadline:?}; killed"),
+            );
+        }
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(out),
+            Ok(Some(status)) => return Err(err!("key_command `{}` failed ({status})", argv[0])),
+            Ok(None) if start.elapsed() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5))
             }
-            parse_key(&stdout, "key_command output")
+            Ok(None) => {
+                return fail(
+                    &mut child,
+                    format!("did not exit within {deadline:?}; killed"),
+                );
+            }
+            Err(e) => return fail(&mut child, format!("could not be waited for: {e}")),
         }
     }
 }
@@ -347,6 +412,41 @@ mod tests {
         h.extend_from_slice(&ct);
         let v = Vault::decrypt(&h, &key).unwrap();
         assert_eq!(v.generation, 0);
+    }
+
+    #[test]
+    fn key_command_is_bounded() {
+        let sh = |script: &str| vec!["/bin/sh".to_string(), "-c".into(), script.into()];
+        let key = "ab".repeat(32);
+        let out = run_key_command(&sh(&format!("echo {key}")), KEY_COMMAND_DEADLINE).unwrap();
+        assert_eq!(parse_key(&out, "k").unwrap()[0], 0xab);
+        assert!(run_key_command(&sh("exit 3"), KEY_COMMAND_DEADLINE).is_err());
+        // A command that hangs is killed (with its children) at the deadline.
+        let t = std::time::Instant::now();
+        let e = run_key_command(
+            &sh("sleep 30 & sleep 30; echo late"),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("did not finish") || e.contains("did not exit"),
+            "{e}"
+        );
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
+        // Endless output is cut off at the cap.
+        let e = run_key_command(&sh("yes"), KEY_COMMAND_DEADLINE)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("more than 4096 bytes"), "{e}");
+        // Closing stdout early but running on still hits the deadline.
+        let e = run_key_command(
+            &sh(&format!("echo {key}; exec >&-; sleep 30")),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("did not exit"), "{e}");
     }
 
     #[test]
