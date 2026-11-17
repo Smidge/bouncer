@@ -609,7 +609,11 @@ fn facility(name: &str) -> Option<u8> {
 }
 
 fn parse_sink(t: &mut Tbl, kind: &str) -> Result<SinkKind> {
-    let insecure = t.bool("allow_insecure_http", false)?;
+    // Only the HTTP sinks know `allow_insecure_http`; elsewhere it is an unknown key.
+    let insecure = match kind {
+        "s3" | "influxdb" | "http" => t.bool("allow_insecure_http", false)?,
+        _ => false,
+    };
     Ok(match kind {
         "s3" => {
             if t.map.contains_key("access_key_id_secret")
@@ -672,12 +676,10 @@ fn parse_sink(t: &mut Tbl, kind: &str) -> Result<SinkKind> {
     })
 }
 
+/// Every key is read and checked whether or not the check is enabled, and unknown keys are
+/// errors, so a typo such as `enabeld = true` cannot silently leave it off.
 fn parse_admission(mut t: Tbl) -> Result<Option<AdmissionConfig>> {
-    if !t.bool("enabled", false)? {
-        // Keep validating so typos are still reported, but nothing else is required.
-        t.map.clear();
-        return Ok(None);
-    }
+    let enabled = t.bool("enabled", false)?;
     let insecure = t.bool("allow_insecure_http", false)?;
     let provider = match t.str("provider")?.as_deref() {
         Some("anthropic") | None => Provider::Anthropic,
@@ -701,19 +703,30 @@ fn parse_admission(mut t: Tbl) -> Result<Option<AdmissionConfig>> {
             ));
         }
     };
-    let c = AdmissionConfig {
-        provider,
-        endpoint: t.url("endpoint", Some(default_endpoint), insecure)?,
-        model: t.req("model")?,
-        api_key: t.req_secret("api_key")?,
-        timeout: Duration::from_millis(t.int("timeout_ms", 8000)?.clamp(100, 120_000)),
-        on_error_allow,
-        system_prompt_file: t.str("system_prompt_file")?.map(PathBuf::from),
-        cache_ttl: Duration::from_secs(t.int("cache_ttl_secs", 0)?),
-        history: t.int("history", 5)?.min(50) as usize,
-    };
+    let endpoint = t.url("endpoint", Some(default_endpoint), insecure)?;
+    let model = t.str("model")?;
+    let api_key = t.secret("api_key")?;
+    let timeout = Duration::from_millis(t.int("timeout_ms", 8000)?.clamp(100, 120_000));
+    let system_prompt_file = t.str("system_prompt_file")?.map(PathBuf::from);
+    let cache_ttl = Duration::from_secs(t.int("cache_ttl_secs", 0)?);
+    let history = t.int("history", 5)?.min(50) as usize;
+    let what = t.what.clone();
     t.done()?;
-    Ok(Some(c))
+    if !enabled {
+        return Ok(None);
+    }
+    let required = |k: &str| err!("{what}: `{k}` is required when enabled = true");
+    Ok(Some(AdmissionConfig {
+        provider,
+        endpoint,
+        model: model.ok_or_else(|| required("model"))?,
+        api_key: api_key.ok_or_else(|| required("api_key_file or api_key_credential"))?,
+        timeout,
+        on_error_allow,
+        system_prompt_file,
+        cache_ttl,
+        history,
+    }))
 }
 
 /// Looks up a user name or numeric uid.
@@ -1104,6 +1117,18 @@ api_key_file = "/etc/bouncer/llm.key"
                 .contains("api_key")
         );
         assert!(bad("[admission]\nenabled = false\nmodel = \"m\"").is_none());
+        // A misspelt or mistyped key is an error even when the check is (or looks) off.
+        let e = bad("[admission]\nenabeld = true\nmodel = \"m\"\napi_key_file = \"/k\"").unwrap();
+        assert!(e.contains("enabeld"), "{e}");
+        assert!(bad("[admission]\nenabled = false\nmodle = \"m\"").is_some());
+        assert!(bad("[admission]\nenabled = \"true\"").is_some());
+        assert!(bad("[admission]\nenabled = false\ntimeout_ms = \"5s\"").is_some());
+        assert!(bad("[admission]\nenabled = false\nprovider = \"opneai\"").is_some());
+        assert!(bad("[admission]\nendpoint = \"http://x\"").is_some());
+        assert!(bad("[admission]\n").is_none());
+        let e =
+            bad("[[sink]]\ntype = \"file\"\npath = \"/x\"\nallow_insecure_http = true").unwrap();
+        assert!(e.contains("allow_insecure_http"), "{e}");
         assert!(bad("[[sink]]\ntype = \"file\"\npath = \"/a\"\nname = \"x\"\n[[sink]]\ntype = \"file\"\npath = \"/b\"\nname = \"x\"").is_some());
     }
 }
