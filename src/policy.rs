@@ -10,6 +10,9 @@ pub struct SecretMeta<'a> {
     pub name: &'a str,
     pub desc: Option<&'a str>,
     pub tags: &'a [String],
+    /// The version decided on (`vault::Secret::rev`). The daemon only releases the value if
+    /// the secret still has this version afterwards.
+    pub rev: u64,
 }
 
 /// Who is asking, as established by the OS.
@@ -56,6 +59,9 @@ pub trait Policy: Send + Sync {
             admission: None,
         }
     }
+
+    /// Called after every change to the vault; a policy that caches decisions drops them.
+    fn invalidate(&self) {}
 }
 
 /// Releases everything. Accountability only comes from the audit log.
@@ -112,6 +118,7 @@ mod tests {
                 name: "X",
                 desc: None,
                 tags: &[],
+                rev: 1,
             }],
             caller: Caller {
                 peer: PeerCred {

@@ -39,8 +39,40 @@ use crate::vault::{self, Key, Secret, Vault, valid_name};
 const WORKER_STACK: usize = 512 * 1024;
 const REJECT_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
-/// A secret's (name, description, tags).
-type Meta = (String, Option<String>, Vec<String>);
+/// What a read decision was made on: a secret's metadata and version, never its value.
+struct Meta {
+    name: String,
+    desc: Option<String>,
+    tags: Vec<String>,
+    rev: u64,
+}
+
+enum Outcome {
+    Denied,
+    Missing(Vec<String>),
+    /// A secret changed again after the decision was re-made.
+    Changed,
+    Release(Vec<SecretValue>),
+}
+
+/// The size of a response's encoding, without making a copy of it.
+fn encoded_len(resp: &Response) -> usize {
+    struct Count(usize);
+    impl Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 += b.len();
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Count(0);
+    match serde_json::to_writer(&mut c, resp) {
+        Ok(()) => c.0 + 1,
+        Err(_) => usize::MAX,
+    }
+}
 
 #[derive(Default)]
 pub struct Options {
@@ -800,55 +832,86 @@ impl Server {
         }
         let reason = req.reason.trim();
         let thread = at.thread(&self.cfg.context_vars).map(str::to_string);
-        // Metadata only; the lock is not held while policies (or the model) run.
-        let (metas, missing): (Vec<Meta>, Vec<String>) = {
-            let v = self.vault.read().unwrap_or_else(|e| e.into_inner());
-            let metas = req
-                .names
-                .iter()
-                .filter_map(|n| {
-                    v.secrets
-                        .get(n)
-                        .map(|s| (n.clone(), s.desc.clone(), s.tags.clone()))
-                })
-                .collect();
-            let missing = req
-                .names
-                .iter()
-                .filter(|n| !v.secrets.contains_key(*n))
-                .cloned()
-                .collect();
-            (metas, missing)
-        };
-        let input = PolicyInput {
-            op: req.op,
-            secrets: metas
-                .iter()
-                .map(|(n, d, t)| SecretMeta {
-                    name: n,
-                    desc: d.as_deref(),
-                    tags: t,
-                })
-                .collect(),
-            caller: policy::Caller {
-                peer,
-                attribution: at,
-                thread: thread.as_deref(),
-            },
-            reason,
-        };
-        let verdict = self.decide(&input, at, &metas, missing.is_empty());
         let mut e = self.entry(req, peer, at);
+        // The decision is bound to the versions it was made on. If a secret changes while the
+        // policies (or the model) run, decide again on the new version, once; a second change
+        // is denied.
+        let mut changed_twice = false;
+        let (verdict, outcome) = loop {
+            // Metadata only; the lock is not held while policies (or the model) run.
+            let (metas, missing): (Vec<Meta>, Vec<String>) = {
+                let v = self.vault.read().unwrap_or_else(|e| e.into_inner());
+                let mut metas = Vec::new();
+                let mut missing = Vec::new();
+                for n in &req.names {
+                    match v.secrets.get(n) {
+                        Some(s) => metas.push(Meta {
+                            name: n.clone(),
+                            desc: s.desc.clone(),
+                            tags: s.tags.clone(),
+                            rev: s.rev,
+                        }),
+                        None => missing.push(n.clone()),
+                    }
+                }
+                (metas, missing)
+            };
+            let input = PolicyInput {
+                op: req.op,
+                secrets: metas
+                    .iter()
+                    .map(|m| SecretMeta {
+                        name: &m.name,
+                        desc: m.desc.as_deref(),
+                        tags: &m.tags,
+                        rev: m.rev,
+                    })
+                    .collect(),
+                caller: policy::Caller {
+                    peer,
+                    attribution: at,
+                    thread: thread.as_deref(),
+                },
+                reason,
+            };
+            let verdict = self.decide(&input, at, &metas, missing.is_empty());
+            if verdict.decision != Decision::Allow {
+                break (verdict, Outcome::Denied);
+            }
+            if !missing.is_empty() {
+                break (verdict, Outcome::Missing(missing));
+            }
+            let v = self.vault.read().unwrap_or_else(|e| e.into_inner());
+            let values: Option<Vec<SecretValue>> = metas
+                .iter()
+                .map(|m| {
+                    v.secrets
+                        .get(&m.name)
+                        .filter(|s| s.rev == m.rev)
+                        .map(|s| SecretValue(s.value.clone()))
+                })
+                .collect();
+            drop(v);
+            match values {
+                Some(values) => break (verdict, Outcome::Release(values)),
+                None if !changed_twice => changed_twice = true,
+                None => break (verdict, Outcome::Changed),
+            }
+        };
         e.policy = verdict.policy;
         e.admission = verdict.admission.clone();
-        let mut resp = match &verdict.decision {
-            Decision::Deny(why) => {
+        let mut resp = match outcome {
+            Outcome::Denied => {
+                let why = match &verdict.decision {
+                    Decision::Deny(why) => why.clone(),
+                    _ => "denied".to_string(),
+                };
                 e.decision = "deny";
                 e.result = "denied";
                 e.why = Some(why.clone());
-                Response::fail(E_DENIED, why.clone())
+                Response::fail(E_DENIED, why)
             }
-            _ if !missing.is_empty() => {
+            Outcome::Missing(missing) => {
                 e.decision = "allow";
                 e.result = "not_found";
                 Response::fail(
@@ -856,46 +919,32 @@ impl Server {
                     format!("no secret named {}", missing.join(", ")),
                 )
             }
-            _ => {
+            Outcome::Changed => {
+                let why = "a requested secret changed twice while the request was being decided; try again";
+                e.decision = "deny";
+                e.result = "denied";
+                e.why = Some(why.into());
+                Response::fail(E_DENIED, why)
+            }
+            Outcome::Release(values) => {
                 e.decision = "allow";
-                let v = self.vault.read().unwrap_or_else(|e| e.into_inner());
-                let values: Option<Vec<SecretValue>> = req
-                    .names
-                    .iter()
-                    .map(|n| v.secrets.get(n).map(|s| SecretValue(s.value.clone())))
-                    .collect();
-                drop(v);
-                match values {
-                    None => {
-                        e.result = "not_found";
-                        Response::fail(
-                            E_NOT_FOUND,
-                            "a secret was removed while the request was decided",
-                        )
-                    }
-                    Some(values)
-                        if values.iter().map(|x| x.0.len() + 16).sum::<usize>()
-                            > proto::MAX_RESPONSE - 4096 =>
-                    {
-                        e.result = "error";
-                        e.why = Some("response too large".into());
-                        Response::fail(
-                            E_BAD_REQUEST,
-                            "the requested values are too large for one response; ask for fewer",
-                        )
-                    }
-                    Some(values) => {
-                        e.result = "ok";
-                        Response {
-                            ok: true,
-                            values,
-                            ..Default::default()
-                        }
-                    }
+                e.result = "ok";
+                Response {
+                    ok: true,
+                    values,
+                    ..Default::default()
                 }
             }
         };
         resp.reasoning = verdict.reasoning;
+        if resp.ok && encoded_len(&resp) > proto::MAX_RESPONSE {
+            resp = Response::fail(
+                E_BAD_REQUEST,
+                "the requested values are too large for one response; ask for fewer",
+            );
+            e.result = "error";
+            e.why = Some("response too large".into());
+        }
         if let Err(err) = self.append(e) {
             return Response::fail(
                 E_AUDIT,
@@ -931,7 +980,7 @@ impl Server {
         if base.decision != Decision::Allow || !all_found {
             return base;
         }
-        let tags: Vec<&[String]> = metas.iter().map(|m| m.2.as_slice()).collect();
+        let tags: Vec<&[String]> = metas.iter().map(|m| m.tags.as_slice()).collect();
         #[cfg(feature = "net")]
         let required = crate::admission::required(&tags, self.admission.is_some());
         #[cfg(not(feature = "net"))]
@@ -1026,6 +1075,7 @@ impl Server {
                     tags,
                     created,
                     updated: now,
+                    rev: next.generation + 1,
                 },
             );
         }
@@ -1047,8 +1097,12 @@ impl Server {
                 format!("audit log write failed; nothing changed: {err}"),
             );
         }
-        // 2. Persist.
-        match self.save_vault(&bytes) {
+        // 2. Persist. Cached admission decisions are dropped whatever the outcome.
+        let saved = self.save_vault(&bytes);
+        if let Some(a) = &self.admission {
+            a.invalidate();
+        }
+        match saved {
             Ok(()) => {}
             Err(WriteError::NotReplaced(err)) => {
                 let mut abort = Entry::new("abort", &self.host);
@@ -1305,6 +1359,11 @@ pub(crate) mod tests {
 
     impl TestServer {
         pub(crate) fn new(extra: &str) -> TestServer {
+            TestServer::with(|_| extra.to_string())
+        }
+
+        /// `extra` gets the store directory, to put files there and refer to them.
+        pub(crate) fn with(extra: impl FnOnce(&Path) -> String) -> TestServer {
             let dir = std::env::temp_dir().join(format!(
                 "bouncer-srv-{}-{}",
                 std::process::id(),
@@ -1313,7 +1372,8 @@ pub(crate) mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-            let cfg = config(&dir, extra);
+            let extra = extra(&dir);
+            let cfg = config(&dir, &extra);
             init_store(&cfg);
             TestServer {
                 srv: Some(start(cfg.clone()).unwrap()),
@@ -1433,5 +1493,86 @@ pub(crate) mod tests {
             t.restart().unwrap();
             assert_eq!(t.get("A").values[0].0, want);
         }
+    }
+
+    /// A model that waits for the test before answering the first `pause` calls, so the test
+    /// can change a secret while a decision is being made. Returns the server and the number
+    /// of model calls.
+    #[cfg(feature = "net")]
+    fn paused_admission(
+        pause: usize,
+    ) -> (
+        TestServer,
+        Arc<AtomicUsize>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+    ) {
+        let (in_model_tx, in_model) = mpsc::channel::<()>();
+        let (go, go_rx) = mpsc::channel::<()>();
+        let (in_model_tx, go_rx) = (Mutex::new(in_model_tx), Mutex::new(go_rx));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let (port, _) = crate::sink::testutil::serve(Arc::new(move |_| {
+            if c.fetch_add(1, Ordering::SeqCst) < pause {
+                in_model_tx.lock().unwrap().send(()).unwrap();
+                go_rx.lock().unwrap().recv().unwrap();
+            }
+            let text = r#"{"decision":"allow","reasoning":"fine"}"#;
+            let body = serde_json::json!({"content": [{"type": "text", "text": text}]});
+            (200, body.to_string())
+        }));
+        let t = TestServer::with(|dir| {
+            let key = dir.join("llm-key");
+            util::write_file_atomic(&key, b"fake-llm-key", 0o600).unwrap();
+            format!(
+                "[admission]\nenabled = true\nendpoint = \"http://127.0.0.1:{port}/v1/messages\"\n\
+                 allow_insecure_http = true\nmodel = \"m\"\napi_key_file = \"{}\"\n",
+                key.display()
+            )
+        });
+        (t, calls, in_model, go)
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn admission_is_bound_to_the_versions_it_decided_on() {
+        // Changed once while the model decides: decided again, and the new value released.
+        let (t, calls, in_model, go) = paused_admission(1);
+        assert!(t.set("A", "version-one").ok);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| t.get("A"));
+            in_model.recv().unwrap();
+            assert!(t.set("A", "version-two").ok);
+            go.send(()).unwrap();
+            let r = h.join().unwrap();
+            assert!(r.ok, "{:?}", r.error);
+            assert_eq!(r.values[0].0, "version-two");
+        });
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "decided again on the new version"
+        );
+
+        // Changed again during the second decision: denied, nothing released.
+        let (t, calls, in_model, go) = paused_admission(2);
+        assert!(t.set("A", "version-one").ok);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| t.get("A"));
+            for v in ["version-two", "version-three"] {
+                in_model.recv().unwrap();
+                assert!(t.set("A", v).ok);
+                go.send(()).unwrap();
+            }
+            let r = h.join().unwrap();
+            assert!(!r.ok && r.values.is_empty());
+            assert!(r.error.unwrap().contains("changed"));
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let last = t.ops().pop().unwrap();
+        assert_eq!(
+            (last["op"].as_str(), last["result"].as_str()),
+            (Some("get"), Some("denied"))
+        );
     }
 }

@@ -13,7 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::audit::AdmissionRecord;
@@ -75,8 +75,11 @@ struct Prompt<'a> {
     time: String,
 }
 
-/// (thread, sorted secret names, reason)
-type CacheKey = (String, String, String);
+/// SHA-256 of everything a cached decision depends on (see `cache_key`).
+type CacheKey = [u8; 32];
+
+/// History is kept per (peer uid, session).
+type HistoryKey = (u32, String);
 
 pub struct Admission {
     cfg: AdmissionConfig,
@@ -84,7 +87,33 @@ pub struct Admission {
     system_prompt: String,
     agent: ureq::Agent,
     cache: Mutex<HashMap<CacheKey, (Instant, bool, String)>>,
-    history: Mutex<HashMap<String, VecDeque<HistoryItem>>>,
+    history: Mutex<HashMap<HistoryKey, VecDeque<HistoryItem>>>,
+}
+
+/// A decision can be reused only for the same caller (uid, session and process chain), the
+/// same operation and reason, and the same versions and metadata of the same secrets.
+/// Returns None when there is no session to tie it to.
+fn cache_key(input: &PolicyInput) -> Option<CacheKey> {
+    let thread = input.caller.thread?;
+    let at = input.caller.attribution;
+    let mut secrets: Vec<_> = input
+        .secrets
+        .iter()
+        .map(|s| (s.name, s.rev, s.desc, s.tags))
+        .collect();
+    secrets.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    // The process chain without pids, which differ on every call.
+    let chain: Vec<_> = at.chain.iter().map(|c| (&c.uid, &c.exe, &c.argv)).collect();
+    let key = serde_json::json!({
+        "uid": input.caller.peer.uid,
+        "op": input.op.as_str(),
+        "thread": thread,
+        "reason": input.reason,
+        "secrets": secrets,
+        "chain": chain,
+        "status": at.status,
+    });
+    Some(util::sha256(&serde_json::to_vec(&key).ok()?))
 }
 
 /// Whether the admission check applies to a set of secrets: `admission/always` on any of
@@ -144,7 +173,7 @@ impl Admission {
                 self.history
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .get(t)
+                    .get(&(input.caller.peer.uid, t.to_string()))
                     .cloned()
             })
             .map(|h| h.into_iter().collect())
@@ -253,11 +282,12 @@ impl Admission {
         let (Some(t), true) = (thread, self.cfg.history > 0) else {
             return;
         };
+        let key = (input.caller.peer.uid, t.to_string());
         let mut h = self.history.lock().unwrap_or_else(|e| e.into_inner());
-        if h.len() >= MAX_THREADS && !h.contains_key(t) {
+        if h.len() >= MAX_THREADS && !h.contains_key(&key) {
             h.clear();
         }
-        let q = h.entry(t.to_string()).or_default();
+        let q = h.entry(key).or_default();
         q.push_back(HistoryItem {
             ts: util::rfc3339_ms(util::now_ms()),
             secrets: input.secrets.iter().map(|s| s.name.to_string()).collect(),
@@ -270,26 +300,36 @@ impl Admission {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Word {
+    Allow,
+    Deny,
+}
+
+/// The only reply accepted. Derived deserialisation rejects a repeated key, and
+/// `deny_unknown_fields` any other key; `Word` accepts exactly "allow" or "deny".
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Reply {
+    decision: Word,
+    reasoning: String,
+}
+
 /// Parses the model's reply. Only the exact two-field JSON object is accepted.
 pub fn parse_reply(text: &str) -> Result<(bool, String)> {
-    let v: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text.trim())
-        .map_err(|_| err!("the model did not reply with a JSON object"))?;
-    if v.len() != 2 {
-        return Err(err!(
-            "the model's reply must have exactly `decision` and `reasoning`"
-        ));
+    let r: Reply = serde_json::from_str(text.trim()).map_err(|_| {
+        err!(
+            "the model's reply is not exactly {{\"decision\": \"allow\" or \"deny\", \"reasoning\": \"...\"}}"
+        )
+    })?;
+    if r.reasoning.trim().is_empty() {
+        return Err(err!("the model gave no reasoning"));
     }
-    let allow = match v.get("decision").and_then(|d| d.as_str()) {
-        Some("allow") => true,
-        Some("deny") => false,
-        _ => return Err(err!("the model's decision is not \"allow\" or \"deny\"")),
-    };
-    let reasoning = v
-        .get("reasoning")
-        .and_then(|r| r.as_str())
-        .filter(|r| !r.trim().is_empty())
-        .ok_or_else(|| err!("the model gave no reasoning"))?;
-    Ok((allow, util::cap(reasoning.trim(), MAX_REASONING)))
+    Ok((
+        matches!(r.decision, Word::Allow),
+        util::cap(r.reasoning.trim(), MAX_REASONING),
+    ))
 }
 
 impl Policy for Admission {
@@ -301,12 +341,18 @@ impl Policy for Admission {
         self.verdict(input).decision
     }
 
+    fn invalidate(&self) {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
     fn verdict(&self, input: &PolicyInput) -> Verdict {
         let thread = input.caller.thread;
-        let mut names: Vec<&str> = input.secrets.iter().map(|s| s.name).collect();
-        names.sort_unstable();
-        let key = thread.map(|t| (t.to_string(), names.join(","), input.reason.to_string()));
         let ttl = self.cfg.cache_ttl;
+        let key = if ttl.is_zero() {
+            None
+        } else {
+            cache_key(input)
+        };
         let mut cached = None;
         if let (Some(k), false) = (&key, ttl.is_zero()) {
             let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -400,23 +446,57 @@ mod tests {
     }
 
     fn ask(a: &Admission, reason: &str, thread: Option<&str>) -> Verdict {
+        ask_as(a, reason, thread, Req::default())
+    }
+
+    /// The parts of a request the cache and history must tell apart.
+    #[derive(Clone)]
+    struct Req {
+        uid: u32,
+        op: Op,
+        rev: u64,
+        desc: &'static str,
+        exe: &'static str,
+    }
+
+    impl Default for Req {
+        fn default() -> Req {
+            Req {
+                uid: 1,
+                op: Op::Get,
+                rev: 3,
+                desc: "PAT",
+                exe: "/usr/bin/agent",
+            }
+        }
+    }
+
+    fn ask_as(a: &Admission, reason: &str, thread: Option<&str>, r: Req) -> Verdict {
         let at = Attribution {
             status: "ok".into(),
+            chain: vec![crate::peer::ChainEntry {
+                pid: 4242,
+                uid: Some(r.uid),
+                exe: Some(r.exe.into()),
+                argv: Some("agent run".into()),
+                env: true,
+            }],
             ..Default::default()
         };
         let tags = vec!["work".to_string()];
         a.verdict(&PolicyInput {
-            op: Op::Get,
+            op: r.op,
             secrets: vec![SecretMeta {
                 name: "GITHUB_TOKEN",
-                desc: Some("PAT"),
+                desc: Some(r.desc),
                 tags: &tags,
+                rev: r.rev,
             }],
             caller: Caller {
                 peer: PeerCred {
-                    uid: 1,
+                    uid: r.uid,
                     gid: 1,
-                    pid: 1,
+                    pid: 4242,
                 },
                 attribution: &at,
                 thread,
@@ -545,6 +625,134 @@ mod tests {
         let v = ask(&a, "deploy the docs site", None);
         assert!(t.elapsed() < Duration::from_secs(5));
         assert!(matches!(v.decision, Decision::Deny(_)));
+    }
+
+    #[test]
+    fn cache_key_covers_caller_operation_versions_and_metadata() {
+        let (a, seen) = adm(
+            Provider::Anthropic,
+            Arc::new(|_| {
+                (
+                    200,
+                    anthropic_reply("{\"decision\":\"allow\",\"reasoning\":\"ok\"}"),
+                )
+            }),
+            |c| c.cache_ttl = Duration::from_secs(60),
+        );
+        let calls = || seen.lock().unwrap().len();
+        let r = "deploy the docs site";
+        ask_as(&a, r, Some("t"), Req::default());
+        assert!(
+            ask_as(&a, r, Some("t"), Req::default())
+                .admission
+                .unwrap()
+                .cached
+        );
+        assert_eq!(calls(), 1);
+        // Each of these differs in one thing the decision depended on: none may reuse it.
+        let variants = [
+            Req {
+                uid: 2,
+                ..Req::default()
+            },
+            Req {
+                op: Op::Exec,
+                ..Req::default()
+            },
+            Req {
+                rev: 4,
+                ..Req::default()
+            },
+            Req {
+                desc: "PAT, now with admin scope",
+                ..Req::default()
+            },
+            Req {
+                exe: "/tmp/other",
+                ..Req::default()
+            },
+        ];
+        for (i, v) in variants.iter().enumerate() {
+            let verdict = ask_as(&a, r, Some("t"), v.clone());
+            assert!(
+                !verdict.admission.unwrap().cached,
+                "variant {i} hit the cache"
+            );
+            assert_eq!(calls(), 2 + i);
+        }
+        // Any change to the vault drops every cached decision.
+        assert!(
+            ask_as(&a, r, Some("t"), Req::default())
+                .admission
+                .unwrap()
+                .cached
+        );
+        a.invalidate();
+        assert!(
+            !ask_as(&a, r, Some("t"), Req::default())
+                .admission
+                .unwrap()
+                .cached
+        );
+    }
+
+    #[test]
+    fn history_is_per_uid_and_session() {
+        let (a, seen) = adm(
+            Provider::Anthropic,
+            Arc::new(|_| {
+                (
+                    200,
+                    anthropic_reply("{\"decision\":\"allow\",\"reasoning\":\"ok\"}"),
+                )
+            }),
+            |_| {},
+        );
+        ask_as(&a, "first request from uid one", Some("t"), Req::default());
+        let other = Req {
+            uid: 2,
+            ..Req::default()
+        };
+        ask_as(&a, "a request from uid two", Some("t"), other);
+        ask_as(&a, "second request from uid one", Some("t"), Req::default());
+        let bodies: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        // Another uid with the same session id does not see (or add to) uid 1's history.
+        assert!(!bodies[1].contains("first request from uid one"));
+        assert!(bodies[2].contains("first request from uid one"));
+        assert!(!bodies[2].contains("a request from uid two"));
+    }
+
+    #[test]
+    fn strict_reply_parsing() {
+        assert_eq!(
+            parse_reply(r#"{"decision":"allow","reasoning":"fine"}"#).unwrap(),
+            (true, "fine".to_string())
+        );
+        for bad in [
+            // A repeated key, either order.
+            r#"{"decision":"deny","decision":"allow","reasoning":"x"}"#,
+            r#"{"decision":"allow","reasoning":"x","decision":"deny"}"#,
+            r#"{"decision":"allow","reasoning":"x","reasoning":"y"}"#,
+            // Other decision words and types.
+            r#"{"decision":"Allow","reasoning":"x"}"#,
+            r#"{"decision":"allow ","reasoning":"x"}"#,
+            r#"{"decision":"maybe","reasoning":"x"}"#,
+            r#"{"decision":true,"reasoning":"x"}"#,
+            r#"{"decision":["allow"],"reasoning":"x"}"#,
+            r#"{"decision":"allow","reasoning":5}"#,
+            r#"{"decision":"allow","reasoning":"  "}"#,
+            // Extra keys or content.
+            r#"{"decision":"allow","reasoning":"x","confidence":1}"#,
+            r#"{"decision":"allow","reasoning":"x"} {"decision":"deny"}"#,
+            r#"[{"decision":"allow","reasoning":"x"}]"#,
+        ] {
+            assert!(parse_reply(bad).is_err(), "accepted {bad}");
+        }
     }
 
     #[test]

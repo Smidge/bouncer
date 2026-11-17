@@ -14,7 +14,7 @@
 //! Version 1 files (8-byte header, no generation) are still read, as generation 0, and are
 //! rewritten as version 2 on the next change.
 //!
-//! The plaintext is JSON: `{"secrets": {"NAME": {"value", "desc", "tags", "created", "updated"}}}`.
+//! The plaintext is JSON: `{"secrets": {"NAME": {"value", "desc", "tags", "created", "updated", "rev"}}}`.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -49,6 +49,10 @@ pub struct Secret {
     pub tags: Vec<String>,
     pub created: String,
     pub updated: String,
+    /// The vault generation that last wrote this secret (0 in older vaults until the next
+    /// change). Identifies the version a policy decision was made on.
+    #[serde(default)]
+    pub rev: u64,
 }
 
 impl Drop for Secret {
@@ -250,6 +254,7 @@ mod tests {
                 tags: vec!["work".into()],
                 created: "t".into(),
                 updated: "t".into(),
+                rev: 7,
             },
         );
         v

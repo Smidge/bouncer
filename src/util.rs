@@ -148,8 +148,12 @@ pub fn base64(bytes: &[u8]) -> String {
     s
 }
 
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    Sha256::digest(data).into()
+}
+
 pub fn sha256_hex(data: &[u8]) -> String {
-    hex(&Sha256::digest(data))
+    hex(&sha256(data))
 }
 
 /// HMAC-SHA256.
